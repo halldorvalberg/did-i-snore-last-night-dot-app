@@ -23,6 +23,13 @@ class GateCfg {
   static const double tHighMargin = 9.0;
   static const double tLowMargin = 5.0;
   static const double madK = 5.0;
+
+  /// Maximum allowed variance (dBFS^2) of a 5-minute window before
+  /// `RuntimeFloorRefiner` will consider lowering `tHigh`. 9.0 dBFS^2
+  /// corresponds to a stddev of ~3 dB across the window — anything noisier
+  /// than that and we assume the user is producing events, not that the
+  /// floor really dropped. Spec §3.3.
+  static const double maxRefinementVarianceDbfs2 = 9.0;
 }
 
 class SpectralCfg {

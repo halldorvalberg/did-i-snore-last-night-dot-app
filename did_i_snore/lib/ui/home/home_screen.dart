@@ -1,22 +1,59 @@
-/// Phase 0 placeholder Home screen.
+/// Phase 0 placeholder Home screen, now extended in Phase 3 with a
+/// "Calibrate this room" entry point.
 ///
 /// Real Home is built in Phase 8 (single big Start/Stop button, elapsed time,
-/// "View last night's events" link). This stub exists so the consent flow
-/// has somewhere to land, and so we can confirm end-to-end that prefs +
-/// router work.
+/// "View last night's events" link). This stub keeps the consent flow and
+/// router wiring honest, plus serves as the launch surface for calibration
+/// while the full home arrives later.
+///
+/// On a successful calibration, the screen records the most recent
+/// `NoiseFloor` for display ("Calibrated: floor X dBFS, threshold Y dBFS").
+/// Persisting it to disk is the calibrator engine's job, not ours; the local
+/// state here is purely a UX courtesy so the user gets immediate feedback
+/// after pressing Save.
 library;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../app.dart';
 import '../../consent/consent_state.dart';
+import '../../recorder/calibrator.dart';
 
-class HomeScreen extends ConsumerWidget {
+class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  /// Latest calibration returned from the calibration screen. Null until
+  /// the user has run calibration this session. Display-only; calibrator
+  /// engine persists the canonical value separately.
+  NoiseFloor? _lastCalibration;
+
+  Future<void> _openCalibration() async {
+    final result = await Navigator.of(context).pushNamed<Object?>(
+      calibrationRoute,
+    );
+    if (!mounted) return;
+    if (result is NoiseFloor) {
+      setState(() => _lastCalibration = result);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Calibration saved. Floor ${result.medianDbfs.toStringAsFixed(1)} '
+            'dBFS, threshold ${result.tHighDbfs.toStringAsFixed(1)} dBFS.',
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
@@ -43,6 +80,24 @@ class HomeScreen extends ConsumerWidget {
                 'build pipeline.',
                 style: theme.textTheme.bodyLarge?.copyWith(height: 1.5),
               ),
+              const SizedBox(height: 28),
+              FilledButton.icon(
+                onPressed: _openCalibration,
+                icon: const Icon(Icons.tune),
+                label: const Text('Calibrate this room'),
+              ),
+              if (_lastCalibration != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  'Calibrated: floor '
+                  '${_lastCalibration!.medianDbfs.toStringAsFixed(1)} dBFS, '
+                  'threshold '
+                  '${_lastCalibration!.tHighDbfs.toStringAsFixed(1)} dBFS.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
               const Spacer(),
               if (kDebugMode)
                 Align(

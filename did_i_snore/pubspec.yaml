@@ -28,6 +28,11 @@ dependencies:
   # right fix; no dependency_overrides needed.
   record: ^6.2.0
 
+  # Phase 3 — calibration. Used to derive a stable per-device id for
+  # `shared_preferences` keying so calibration survives reinstalls of
+  # different app versions on the same hardware.
+  device_info_plus: ^10.1.0
+
   # NOTE: deps for later phases (tflite_flutter, drift, fftea,
   # flutter_background_service, workmanager, flutter_local_notifications,
   # device_info_plus, path_provider, path) are added per-phase to minimise

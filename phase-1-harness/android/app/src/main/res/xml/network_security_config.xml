@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Block all networking. Belt-and-suspenders to the missing INTERNET permission.
+  Even if a future dep tries to use HttpURLConnection, it'll be denied.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <!-- Empty trust anchors: no system, no user, no certs trusted. -->
+        </trust-anchors>
+    </base-config>
+</network-security-config>

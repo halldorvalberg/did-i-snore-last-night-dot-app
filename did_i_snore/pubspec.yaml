@@ -1,0 +1,46 @@
+name: did_i_snore
+description: "Records you while you sleep, throws away the silence, and shows you a timeline of the noises you actually made. Local-only, no network."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # Phase 0 — consent flow + state.
+  flutter_riverpod: ^2.5.1
+  permission_handler: ^11.3.0
+  shared_preferences: ^2.2.0
+
+  # Phase 2 — mic capture.
+  #
+  # `record` ^6.2.0 pulls modern federated platform packages (record_linux
+  # ^1.3.0, record_android ^1.5.0, etc.) that all implement
+  # record_platform_interface ^1.5.0's `startStream` + updated
+  # `hasPermission` signature. Older `record` (5.x) lines pulled
+  # record_linux 0.7.2 transitively, which fails to compile against the 1.5.0
+  # interface even on Android targets — Flutter's compile phase parses every
+  # platform implementation. Pinning record itself to a coherent line is the
+  # right fix; no dependency_overrides needed.
+  record: ^6.2.0
+
+  # NOTE: deps for later phases (tflite_flutter, drift, fftea,
+  # flutter_background_service, workmanager, flutter_local_notifications,
+  # device_info_plus, path_provider, path) are added per-phase to minimise
+  # transitive dependency-resolution conflicts. The full v1 list lives in
+  # docs/IMPLEMENTATION.md 0.2; each phase's slash command pulls in what it
+  # needs.
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/

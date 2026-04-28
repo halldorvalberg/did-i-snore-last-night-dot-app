@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  No-network policy.
+
+  base-config: cleartextTrafficPermitted=false applies to ALL connections by
+  default — any future dependency that tries to phone home over plain HTTP
+  fails at the network layer, not silently.
+
+  trust-anchors empty: no certificates are trusted for any domain. Combined
+  with the absence of the INTERNET permission in the release manifest,
+  this is belt-and-suspenders enforcement of the local-only privacy stance.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors />
+    </base-config>
+</network-security-config>

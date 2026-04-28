@@ -1,0 +1,27 @@
+# THROWAWAY HARNESS - Phase 2 will rebuild this properly.
+# Versions pinned to recent stable per docs/IMPLEMENTATION.md 0.2.
+
+name: phase_1_harness
+description: Background-survival smoke test for did-i-snore-last-night.app.
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # All recording, FGS plumbing, and heartbeat logging now happens in
+  # native Kotlin (RecorderService.kt). Dart only owns the UI shell and
+  # the runtime-permission gates, so permission_handler is the only
+  # third-party dep left.
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

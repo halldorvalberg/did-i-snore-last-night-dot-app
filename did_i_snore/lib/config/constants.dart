@@ -53,6 +53,33 @@ class RetentionCfg {
   static const int minFreeDiskMb = 200;
   static const int janitorIntervalHours = 6;
   static const int hardDeleteAfterDays = 1;
+
+  /// Grace window before the pending-row sweep considers a `state='pending'`
+  /// row as crashed mid-encode. Spec §6.2 line 799. Under normal load the
+  /// encoder finishes well before this; anything older means the worker
+  /// died between INSERT and `markReady`.
+  static const int pendingGraceSeconds = 60;
+}
+
+/// Filesystem layout under the application documents directory. Single
+/// source of truth so the recorder (path generator) and the janitor (sweep
+/// walker) cannot drift apart.
+class PathsCfg {
+  /// Subdirectory holding day-partitioned audio files
+  /// (`<docs>/events/YYYY-MM-DD/<ts>.opus`). The `YYYY-MM-DD` partitioning
+  /// makes the orphan sweep O(events_today) instead of O(all_events_ever).
+  static const String eventsDir = 'events';
+
+  /// Atomic-rename suffix used by the encoder before flipping a row to
+  /// `state='ready'`. The pending sweep also unlinks `<audioPath>$tmpSuffix`
+  /// when it tears down a stale pending row.
+  static const String tmpSuffix = '.tmp';
+
+  /// Audio file extension the encoder writes (Phase 7) and the orphan
+  /// sweep recognises. Files with other extensions in `eventsDir` (e.g.
+  /// `.peaks` sidecars) are left alone by the orphan sweep — they're
+  /// tracked through the `peaks_path` column.
+  static const String audioExtension = '.opus';
 }
 
 class EncoderCfg {

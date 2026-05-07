@@ -32,6 +32,7 @@ import 'dart:typed_data';
 
 import '../classifier/label_map.dart';
 import '../config/constants.dart';
+import '../data/event_repo.dart';
 import 'calibrator.dart';
 import 'energy.dart';
 import 'event_window.dart';
@@ -149,6 +150,21 @@ class RecorderService {
   /// the null path keeps unit tests free of native-tflite dependencies.
   final Classifier? _classifier;
 
+  /// Optional persistence sink. When non-null, every accepted
+  /// `ClassifiedEvent` triggers an `insertPending` row write before the
+  /// event is added to the public `events` stream.
+  ///
+  /// Approach (a) from the Phase 6 brief: constructor injection on the
+  /// recorder. Chosen over (b) — a separate side-effect listener — to
+  /// keep the wire-up colocated with the producer. The downside is
+  /// `RecorderService` now imports `data/`; in exchange, the call site
+  /// is one line and the order-of-effects (DB write before stream emit)
+  /// is impossible to get wrong.
+  ///
+  /// Null in unit tests so the existing harness keeps running without a
+  /// `path_provider` plugin shim.
+  final EventRepo? _repo;
+
   /// Whether the spectral pre-filter is enabled for this session.
   /// Decided once at construction from `noiseFloor.madDbfs`. Per spec
   /// §4.2 the filter is a fan-rejector that fails in noisy ambients, so
@@ -163,6 +179,7 @@ class RecorderService {
     required Gate gate,
     required SpectralProbe probe,
     required Classifier? classifier,
+    required EventRepo? repo,
   })  : _noiseFloor = noiseFloor,
         _mic = mic,
         _slicer = slicer,
@@ -170,6 +187,7 @@ class RecorderService {
         _gate = gate,
         _probe = probe,
         _classifier = classifier,
+        _repo = repo,
         _filterEnabled =
             noiseFloor.madDbfs <= SpectralCfg.maxAmbientMadForFilter {
     // The gate's ring MUST be the same instance as the recorder's ring,
@@ -195,6 +213,7 @@ class RecorderService {
     Gate? gate,
     SpectralProbe? probe,
     Classifier? classifier,
+    EventRepo? repo,
   }) {
     final r = ring ?? RingBuffer(_ringBytes);
     final g = gate ??
@@ -211,6 +230,7 @@ class RecorderService {
       gate: g,
       probe: probe ?? SpectralProbe(),
       classifier: classifier,
+      repo: repo,
     );
   }
 
@@ -449,7 +469,49 @@ class RecorderService {
   }
 
   void _emitEvent(ClassifiedEvent ev) {
+    // Phase 5 → Phase 6 bridge: write the `state='pending'` row before
+    // surfacing the event on the stream. The insert is fire-and-forget
+    // (no `await`) because the mic loop must not stall on disk I/O — a
+    // slow DB write would back-pressure mic chunks and we'd start
+    // dropping audio. Insert errors are swallowed; if they become a
+    // real failure mode we'll surface them via debug telemetry in a
+    // later phase.
+    //
+    // The `audioPath` here is the canonical layout from spec §6.3:
+    // `events/YYYY-MM-DD/<startedAt>.opus`. Phase 7's encoder writes
+    // the actual file at this path (via `<final>.tmp` → rename).
+    final repo = _repo;
+    if (repo != null) {
+      final relPath = _audioRelPathForEvent(ev);
+      // ignore: discarded_futures — fire-and-forget; see comment above.
+      repo
+          .insertPending(
+            startedAt: ev.window.startMs,
+            endedAt: ev.window.startMs + ev.window.durationMs,
+            durationMs: ev.window.durationMs,
+            audioPath: relPath,
+          )
+          .catchError((_) => -1);
+    }
     if (!_eventsOut.isClosed) _eventsOut.add(ev);
+  }
+
+  /// Canonical relative `audioPath` for a `ClassifiedEvent`, matching
+  /// the layout in spec §6.3:
+  /// `events/YYYY-MM-DD/<startedAt>.opus`.
+  ///
+  /// `YYYY-MM-DD` derives from `startedAt` in **local** time so the
+  /// partition aligns with the local-day window the timeline query
+  /// uses. (Spec §8 line 901 day-boundary policy.) UTC partitioning
+  /// would mean a 19:00 PT event lands in tomorrow's folder for users
+  /// west of UTC.
+  static String _audioRelPathForEvent(ClassifiedEvent ev) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(ev.window.startMs);
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '${PathsCfg.eventsDir}/$y-$m-$d/'
+        '${ev.window.startMs}${PathsCfg.audioExtension}';
   }
 
   void _emitRejection(RejectedEvent rej) {

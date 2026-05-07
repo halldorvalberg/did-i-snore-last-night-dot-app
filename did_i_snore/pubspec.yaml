@@ -47,16 +47,43 @@ dependencies:
   # the embedded yamnet_label_list.txt.
   tflite_flutter: ^0.12.1
 
-  # NOTE: deps for later phases (drift, flutter_background_service,
-  # workmanager, flutter_local_notifications, path_provider, path) are
-  # added per-phase to minimise transitive dependency-resolution
-  # conflicts. The full v1 list lives in docs/IMPLEMENTATION.md 0.2; each
-  # phase's slash command pulls in what it needs.
+  # Phase 6 — persistence. Drift is the typed SQLite layer for events +
+  # recording_gaps; we pair it with `sqlite3_flutter_libs` (NOT
+  # `drift_flutter`) because the latter pulls in `sqflite` for its
+  # platform-channel fallback, and we want pure native SQLite — no MainOf
+  # platform-channel hops on the hot path. `sqlite3_flutter_libs` ships
+  # the prebuilt SQLite `.so`/`.dylib` per ABI; on Android 14+ this works
+  # out of the box without ANGLE/NDK setup. `NativeDatabase.createInBackground`
+  # (from `package:drift/native.dart`) opens against those bundled libs.
+  drift: ^2.20.0
+  sqlite3_flutter_libs: ^0.5.24
+
+  # Phase 6 — path resolution. `audioPath` and `peaksPath` columns store
+  # paths *relative* to `getApplicationDocumentsDirectory()` because iOS
+  # rewrites the sandbox UUID on every TestFlight reinstall — absolute
+  # paths persisted in the DB break across reinstalls. `path` joins the
+  # docs-dir prefix with the relative key at read time.
+  path_provider: ^2.1.4
+  path: ^1.9.0
+
+  # NOTE: deps for later phases (flutter_background_service, workmanager,
+  # flutter_local_notifications) are added per-phase to minimise
+  # transitive dependency-resolution conflicts. The full v1 list lives in
+  # docs/IMPLEMENTATION.md 0.2; each phase's slash command pulls in what
+  # it needs.
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+
+  # Phase 6 — Drift codegen. `drift_dev` reads the table classes in
+  # `lib/data/*.dart` and writes the generated `*.g.dart` companions next
+  # to them; `build_runner` is the orchestrator. Generated files are
+  # committed (not gitignored) so a fresh checkout doesn't have to run
+  # codegen before `flutter analyze` works.
+  build_runner: ^2.4.9
+  drift_dev: ^2.20.0
 
 flutter:
   uses-material-design: true

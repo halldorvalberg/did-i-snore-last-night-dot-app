@@ -17,10 +17,13 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:drift/native.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:did_i_snore/config/constants.dart';
+import 'package:did_i_snore/data/db.dart';
+import 'package:did_i_snore/data/event_repo.dart';
 import 'package:did_i_snore/recorder/calibrator.dart';
 import 'package:did_i_snore/recorder/mic_source.dart';
 import 'package:did_i_snore/recorder/recorder_service.dart';
@@ -405,6 +408,93 @@ void main() {
           RejectionReason.classifierError);
       expect(errorResult.rejections.single.reading, isNull,
           reason: 'classifierError rejections carry no SpectralReading');
+    });
+
+    test(
+        'repo injection: an accepted event triggers insertPending with the '
+        "canonical events/YYYY-MM-DD/<startedAt>.opus path in state='pending'",
+        () async {
+      // Phase 6 wire-up: when `repo` is non-null, the recorder must write a
+      // `state='pending'` row before the event surfaces on the public
+      // stream. We back the repo with an in-memory AppDb so the assertion
+      // can read the row back; no path_provider plugin shim required.
+      final db = AppDb.forTesting(NativeDatabase.memory());
+      addTearDown(() async => db.close());
+      final repo = EventRepo(db);
+
+      const floor = NoiseFloor(-50.0, 2.0);
+      final mic = _FakeMicSource();
+      final svc = RecorderService(
+        noiseFloor: floor,
+        mic: mic,
+        // Fake classifier puts us on the §5.3 keep arm: maxCurated = 0.6
+        // ≥ minTopCuratedForKeep (0.3), so the event passes regardless of
+        // the Other score. Result: `_emitEvent` runs → `repo.insertPending`
+        // is invoked.
+        classifier: (_) => {'Snoring': 0.6},
+        repo: repo,
+      );
+
+      final events = <ClassifiedEvent>[];
+      final eSub = svc.events.listen(events.add);
+
+      await svc.start();
+
+      final loudPeak = _peakForDbfs(floor.tHighDbfs + 10.0);
+
+      // 16 frames @ 20 ms wall-clock spacing → gate's 300 ms hold elapses
+      // → gate opens. Use 200 Hz (in-band) so the spectral pre-filter
+      // passes — same shape as the existing keep-case test.
+      var phase = 0;
+      for (var i = 0; i < 16; i++) {
+        await mic.push(_sineFrame(200.0, loudPeak, phaseSamples: phase));
+        phase += AudioCfg.frameBytes ~/ 2;
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+
+      // Pump enough additional in-band frames that post-pre-roll exceeds
+      // _classifierSamples → spectral probe runs and accepts.
+      for (var i = 0; i < 160; i++) {
+        await mic.push(_sineFrame(200.0, loudPeak, phaseSamples: phase));
+        phase += AudioCfg.frameBytes ~/ 2;
+      }
+
+      // Tail: ≥ 1000 ms below tLow → gate closes.
+      for (var i = 0; i < 55; i++) {
+        await mic.push(_silentFrame());
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+
+      // Drain the close handler AND the fire-and-forget insertPending
+      // future. The recorder doesn't `await` the insert (mic loop must
+      // not stall on disk I/O), so we yield here long enough for the
+      // microtask + DB round-trip to settle.
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      await svc.stop();
+      await eSub.cancel();
+
+      expect(events, hasLength(1),
+          reason: 'one accepted event must surface on the stream');
+
+      // Read every row from the `events` table — there should be exactly
+      // one, and it should be in state='pending' (markReady is the
+      // encoder's job, which we have not run here).
+      final rows = await db.select(db.events).get();
+      expect(rows, hasLength(1),
+          reason: 'recorder must insert exactly one pending row per event');
+      final row = rows.single;
+      expect(row.state, 'pending',
+          reason: 'the recorder writes pending only; markReady is owned '
+              'by the encoder layer');
+      expect(row.startedAt, events.single.window.startMs,
+          reason: 'startedAt must match the gate-open timestamp');
+      expect(
+        RegExp(r'^events/\d{4}-\d{2}-\d{2}/\d+\.opus$').hasMatch(row.audioPath),
+        isTrue,
+        reason: 'audioPath must be the canonical relative layout from spec '
+            '§6.3 — got ${row.audioPath}',
+      );
     });
   });
 }

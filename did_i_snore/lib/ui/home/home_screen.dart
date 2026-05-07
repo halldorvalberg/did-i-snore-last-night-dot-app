@@ -20,6 +20,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../app.dart';
 import '../../consent/consent_state.dart';
 import '../../recorder/calibrator.dart';
+import '../../recorder/calibrator_provider.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -41,6 +42,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (!mounted) return;
     if (result is NoiseFloor) {
       setState(() => _lastCalibration = result);
+      // The on-disk value just changed; drop the cached future so any
+      // subsequent watcher re-reads from SharedPreferences.
+      ref.invalidate(persistedNoiseFloorProvider);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -55,6 +59,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // Priority: this session's just-saved value > persisted value > nothing.
+    // Loading and error states render nothing — no spinner, no flicker.
+    final persistedAsync = ref.watch(persistedNoiseFloorProvider);
+    final NoiseFloor? displayedFloor =
+        _lastCalibration ?? persistedAsync.valueOrNull;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Did I Snore?'),
@@ -86,13 +95,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 icon: const Icon(Icons.tune),
                 label: const Text('Calibrate this room'),
               ),
-              if (_lastCalibration != null) ...[
+              if (displayedFloor != null) ...[
                 const SizedBox(height: 12),
                 Text(
                   'Calibrated: floor '
-                  '${_lastCalibration!.medianDbfs.toStringAsFixed(1)} dBFS, '
+                  '${displayedFloor.medianDbfs.toStringAsFixed(1)} dBFS, '
                   'threshold '
-                  '${_lastCalibration!.tHighDbfs.toStringAsFixed(1)} dBFS.',
+                  '${displayedFloor.tHighDbfs.toStringAsFixed(1)} dBFS.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),

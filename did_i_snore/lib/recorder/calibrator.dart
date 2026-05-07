@@ -139,9 +139,10 @@ class RuntimeFloorRefiner {
 /// Snapshot of the live calibration session for the UI to render.
 ///
 /// `historyDbfs` is the last 30 seconds of 100 ms-smoothed RMS values
-/// (length up to 300). `estimatedFloorDbfs` is the running median of
-/// every frame-RMS collected so far this session — the UI uses it to
-/// gate the Save button via `canSave`.
+/// (length up to 300). `estimatedFloorDbfs` is the prospective gate
+/// `tHigh` (`median + GateCfg.madK * MAD`) computed over every frame-RMS
+/// collected so far — the UI uses it to gate the Save button via
+/// `canSave` and renders it as the "stay-under" line on the strip.
 class CalibrationState {
   /// Latest 100 ms-smoothed RMS in dBFS.
   final double rmsDbfs;
@@ -150,8 +151,10 @@ class CalibrationState {
   /// Length up to 300 (30 s * 10 Hz).
   final List<double> historyDbfs;
 
-  /// Running median of *all* frame-RMS values collected so far. Used as
-  /// the "estimated quiet floor" the contiguous-quiet timer compares to.
+  /// Prospective gate threshold: `median + GateCfg.madK * MAD` over all
+  /// frame-RMS values collected so far. This is the same `tHigh` the
+  /// gate uses post-save, so calibration's "quiet" check matches the
+  /// gate's "no event" condition. Room-adaptive: a fan widens the band.
   final double estimatedFloorDbfs;
 
   /// Milliseconds the smoothed RMS has stayed at or below
@@ -372,10 +375,12 @@ class Calibrator {
       _history.removeAt(0);
     }
 
-    // Running median over collected frame-RMS. Re-sorting once per UI
-    // tick (10 Hz) over <=1500-3000 doubles is fine; doing it per frame
-    // (50 Hz) wouldn't be. The final save() does its own sort.
-    final estimatedFloor = _runningMedianDbfs();
+    // Prospective gate tHigh over collected frame-RMS. Comparing against
+    // the bare median puts ~50% of samples above the line in any non-
+    // silent room (fan, fridge, HVAC), so the streak never accumulates.
+    // Using median + madK*MAD widens the band with room variance — the
+    // exact same threshold the gate enforces post-save.
+    final estimatedFloor = _runningTHighDbfs();
 
     if (smoothedDbfs <= estimatedFloor) {
       _contiguousQuietMs += AudioCfg.frameMs * _smoothingFrames;
@@ -394,22 +399,36 @@ class Calibrator {
     }
   }
 
-  /// Median of all collected frame-RMS dBFS values so far. Returns
+  /// MAD floor: in a perfectly steady room MAD can be 0, which would
+  /// collapse `median + madK*MAD` back to the bare median and reproduce
+  /// the bug this helper exists to fix. Real mic input essentially
+  /// never produces exactly 0 MAD, but flooring at 0.5 dBFS — well
+  /// below normal mic noise variance — costs nothing and is defensive.
+  static const double _madFloorDbfs = 0.5;
+
+  /// Prospective gate `tHigh` (`median + GateCfg.madK * MAD`) over all
+  /// collected frame-RMS dBFS values so far. Returns
   /// `double.negativeInfinity` if no frames have been collected yet, so
   /// the very first tick's `smoothedDbfs <= estimatedFloor` check is
   /// false (no quiet credit before we know the floor).
-  double _runningMedianDbfs() {
+  double _runningTHighDbfs() {
     if (_frameDbfsLen == 0) return double.negativeInfinity;
-    final copy = Float32List(_frameDbfsLen);
-    copy.setRange(0, _frameDbfsLen, _frameDbfs);
-    // Float32List has no in-place sort. Float64List does, but the
-    // collection itself is on the order of a few thousand doubles after
-    // 30 seconds; sorting via a List<double> view is cheap.
-    final list = List<double>.generate(
+    // Float32List has no in-place sort, and the collection is on the
+    // order of a few thousand doubles after 30 seconds; sorting via a
+    // List<double> view is cheap at 10 Hz.
+    final sorted = List<double>.generate(
       _frameDbfsLen,
-      (i) => copy[i],
+      (i) => _frameDbfs[i],
       growable: false,
     )..sort();
-    return list[list.length ~/ 2];
+    final median = sorted[sorted.length ~/ 2];
+    final deviations = List<double>.generate(
+      sorted.length,
+      (i) => (sorted[i] - median).abs(),
+      growable: false,
+    )..sort();
+    var mad = deviations[deviations.length ~/ 2];
+    if (mad < _madFloorDbfs) mad = _madFloorDbfs;
+    return median + GateCfg.madK * mad;
   }
 }

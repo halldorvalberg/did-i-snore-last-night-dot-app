@@ -39,12 +39,19 @@ dependencies:
   # 15360-sample window (= classifierFrameMs at 16 kHz) without padding.
   fftea: ^1.5.0
 
-  # NOTE: deps for later phases (tflite_flutter, drift,
-  # flutter_background_service, workmanager, flutter_local_notifications,
-  # path_provider, path) are added per-phase to minimise transitive
-  # dependency-resolution conflicts. The full v1 list lives in
-  # docs/IMPLEMENTATION.md 0.2; each phase's slash command pulls in what it
-  # needs.
+  # Phase 5 — YAMNet classifier. The bundled int8-quantized YAMNet at
+  # assets/models/yamnet.tflite is a TFLite flatbuffer with appended zip
+  # metadata (TFL3 magic + PK central-directory at the tail). Interpreter
+  # reads only the flatbuffer prefix; the canonical 3-column class map at
+  # assets/models/yamnet_class_map.csv is the label source of truth, not
+  # the embedded yamnet_label_list.txt.
+  tflite_flutter: ^0.12.1
+
+  # NOTE: deps for later phases (drift, flutter_background_service,
+  # workmanager, flutter_local_notifications, path_provider, path) are
+  # added per-phase to minimise transitive dependency-resolution
+  # conflicts. The full v1 list lives in docs/IMPLEMENTATION.md 0.2; each
+  # phase's slash command pulls in what it needs.
 
 dev_dependencies:
   flutter_test:

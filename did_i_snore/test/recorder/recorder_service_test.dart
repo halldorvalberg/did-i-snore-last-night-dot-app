@@ -22,7 +22,6 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:did_i_snore/config/constants.dart';
 import 'package:did_i_snore/recorder/calibrator.dart';
-import 'package:did_i_snore/recorder/event_window.dart';
 import 'package:did_i_snore/recorder/mic_source.dart';
 import 'package:did_i_snore/recorder/recorder_service.dart';
 
@@ -108,12 +107,19 @@ void main() {
       // tHigh = -50 + 5*5 = -25 dBFS, tLow = -50 + 3*5 = -35 dBFS.
       const floor = NoiseFloor(-50.0, 5.0);
       final mic = _FakeMicSource();
-      final svc = RecorderService(noiseFloor: floor, mic: mic);
+      // `classifier: null` skips Phase 5 classification — accepted events
+      // come through with empty labels and `('Other', 0.0)`. Keeps tflite
+      // out of the unit-test harness (it can't load on Linux anyway).
+      final svc = RecorderService(
+        noiseFloor: floor,
+        mic: mic,
+        classifier: null,
+      );
 
       expect(svc.filterEnabled, isFalse,
           reason: 'MAD 5.0 > maxAmbientMadForFilter 4.0 → filter disabled');
 
-      final events = <EventWindow>[];
+      final events = <ClassifiedEvent>[];
       final rejections = <RejectedEvent>[];
       final eSub = svc.events.listen(events.add);
       final rSub = svc.rejections.listen(rejections.add);
@@ -166,9 +172,15 @@ void main() {
       // have rejected it if it had run. If this fails, the test's setup
       // ate its own premise (event was actually too short to be a useful
       // bypass test).
-      expect(events.single.totalBytes, greaterThanOrEqualTo(94720),
+      expect(events.single.window.totalBytes, greaterThanOrEqualTo(94720),
           reason: 'event must be long enough that the bypass is what '
               'saved it, not the short-event skip');
+      // With `classifier: null` the §5.3 path emits an empty label map
+      // and falls back to the Other-tagged top label; assert that
+      // contract here so future regressions don't silently change it.
+      expect(events.single.labels, isEmpty);
+      expect(events.single.topLabel, 'Other');
+      expect(events.single.topScore, 0.0);
     });
 
     test(
@@ -179,12 +191,16 @@ void main() {
       // tHigh = -50 + 5*2 = -40 dBFS, tLow = -50 + 3*2 = -44 dBFS.
       const floor = NoiseFloor(-50.0, 2.0);
       final mic = _FakeMicSource();
-      final svc = RecorderService(noiseFloor: floor, mic: mic);
+      final svc = RecorderService(
+        noiseFloor: floor,
+        mic: mic,
+        classifier: null,
+      );
 
       expect(svc.filterEnabled, isTrue,
           reason: 'MAD 2.0 ≤ maxAmbientMadForFilter 4.0 → filter enabled');
 
-      final events = <EventWindow>[];
+      final events = <ClassifiedEvent>[];
       final rejections = <RejectedEvent>[];
       final eSub = svc.events.listen(events.add);
       final rSub = svc.rejections.listen(rejections.add);
@@ -229,10 +245,10 @@ void main() {
       // Sanity: the event is short enough that the skip is what passed
       // it. If totalBytes ≥ 64000 + 30720 = 94720, the spectral check
       // would have run (and rejected, since it is 2 kHz).
-      expect(events.single.totalBytes, lessThan(94720),
+      expect(events.single.window.totalBytes, lessThan(94720),
           reason: 'event must be short enough post-pre-roll that the skip '
               'branch is what passed it');
-      expect(events.single.durationMs,
+      expect(events.single.window.durationMs,
           greaterThanOrEqualTo(AudioCfg.minEventDurationMs),
           reason: 'must clear the duration filter to reach the spectral '
               'branch in the first place');
@@ -243,9 +259,13 @@ void main() {
         'output streams', () async {
       const floor = NoiseFloor(-50.0, 2.0);
       final mic = _FakeMicSource();
-      final svc = RecorderService(noiseFloor: floor, mic: mic);
+      final svc = RecorderService(
+        noiseFloor: floor,
+        mic: mic,
+        classifier: null,
+      );
 
-      final events = <EventWindow>[];
+      final events = <ClassifiedEvent>[];
       final rejections = <RejectedEvent>[];
       final eDone = Completer<void>();
       final rDone = Completer<void>();
@@ -283,6 +303,108 @@ void main() {
 
       await eSub.cancel();
       await rSub.cancel();
+    });
+
+    test(
+        'YAMNet reject policy: low maxCurated AND high Other → '
+        'lowConfidence rejection; thrown classifier → classifierError '
+        'rejection; otherwise event passes with topLabel set',
+        () async {
+      // Helper to drive a full open-then-close cycle on the given service
+      // with the given fake classifier. We use an in-band 200 Hz tone so
+      // the spectral pre-filter passes (snoreBandFraction is high inside
+      // [50, 500] Hz, flatness is low). The filter is enabled here (MAD =
+      // 2.0 ≤ 4.0); whichever post-spectral path the classifier triggers
+      // is what gets observed.
+      Future<({List<ClassifiedEvent> events, List<RejectedEvent> rejections})>
+          run(Classifier classifier) async {
+        const floor = NoiseFloor(-50.0, 2.0);
+        final mic = _FakeMicSource();
+        final svc = RecorderService(
+          noiseFloor: floor,
+          mic: mic,
+          classifier: classifier,
+        );
+        expect(svc.filterEnabled, isTrue);
+
+        final events = <ClassifiedEvent>[];
+        final rejections = <RejectedEvent>[];
+        final eSub = svc.events.listen(events.add);
+        final rSub = svc.rejections.listen(rejections.add);
+
+        await svc.start();
+
+        final loudPeak = _peakForDbfs(floor.tHighDbfs + 10.0);
+
+        // 16 frames @ 20 ms wall-clock spacing → gate's 300 ms hold
+        // satisfied → gate opens.
+        var phase = 0;
+        for (var i = 0; i < 16; i++) {
+          await mic.push(_sineFrame(200.0, loudPeak, phaseSamples: phase));
+          phase += AudioCfg.frameBytes ~/ 2;
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+
+        // Pump enough additional 200 Hz frames that the post-pre-roll
+        // slice exceeds _classifierSamples (so the spectral probe runs
+        // and passes — 200 Hz is in-band).
+        for (var i = 0; i < 160; i++) {
+          await mic.push(_sineFrame(200.0, loudPeak, phaseSamples: phase));
+          phase += AudioCfg.frameBytes ~/ 2;
+        }
+
+        // Tail: ≥ 1000 ms below tLow → gate closes.
+        for (var i = 0; i < 55; i++) {
+          await mic.push(_silentFrame());
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        await svc.stop();
+        await eSub.cancel();
+        await rSub.cancel();
+
+        return (events: events, rejections: rejections);
+      }
+
+      // Case A — REJECT: maxCurated == 0 (no curated label present),
+      // Other == 0.6 > maxOtherForKeep (0.5).
+      final rejectResult = await run((_) => {'Other': 0.6});
+      expect(rejectResult.events, isEmpty,
+          reason: 'low-confidence event must not surface on `events`');
+      expect(rejectResult.rejections, hasLength(1));
+      expect(rejectResult.rejections.single.reason,
+          RejectionReason.lowConfidence);
+      expect(rejectResult.rejections.single.reading, isNull,
+          reason: 'lowConfidence rejections carry no SpectralReading');
+
+      // Case B — KEEP: maxCurated == 0.5 ≥ minTopCuratedForKeep (0.3),
+      // so the event passes regardless of the Other score. Tests the
+      // disjunctive nature of the §5.3 policy (kept when EITHER curated
+      // has a foothold OR Other isn't dominant).
+      final keepResult =
+          await run((_) => {'Snoring': 0.5, 'Other': 0.3});
+      expect(keepResult.rejections, isEmpty);
+      expect(keepResult.events, hasLength(1));
+      expect(keepResult.events.single.topLabel, 'Snoring');
+      expect(keepResult.events.single.topScore, 0.5);
+      expect(keepResult.events.single.labels, {'Snoring': 0.5, 'Other': 0.3});
+
+      // Case C — REJECT (classifierError): the classifier throws (e.g.
+      // interpreter not loaded, native-side failure, unsupported output
+      // dtype). The recorder must surface this as a loud rejection rather
+      // than silently degrading to Other — a broken model should not be
+      // invisible in field reports.
+      final errorResult = await run((_) {
+        throw StateError('simulated classifier failure');
+      });
+      expect(errorResult.events, isEmpty,
+          reason: 'thrown classifier must not produce a `events` entry');
+      expect(errorResult.rejections, hasLength(1));
+      expect(errorResult.rejections.single.reason,
+          RejectionReason.classifierError);
+      expect(errorResult.rejections.single.reading, isNull,
+          reason: 'classifierError rejections carry no SpectralReading');
     });
   });
 }

@@ -30,6 +30,7 @@ library;
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../classifier/label_map.dart';
 import '../config/constants.dart';
 import 'calibrator.dart';
 import 'energy.dart';
@@ -39,6 +40,12 @@ import 'mic_source.dart';
 import 'pcm_slicer.dart';
 import 'ring_buffer.dart';
 import 'spectral.dart';
+
+/// Classifier seam — Phase 5 wire-up. Production passes
+/// `yamnet.classify`; tests pass any function returning a fixed label →
+/// confidence map. Typedef instead of an interface keeps the recorder free
+/// of polymorphism it doesn't need (the only call site is `_onClose`).
+typedef Classifier = Map<String, double> Function(Int16List pcm);
 
 /// Pre-roll capacity in bytes. Derived once from `AudioCfg`.
 const int _ringBytes = AudioCfg.sampleRateHz * 2 * AudioCfg.preRollMs ~/ 1000;
@@ -55,6 +62,14 @@ class RejectionReason {
   static const String minDuration = 'min_duration';
   static const String spectralBand = 'spectral_band';
   static const String spectralFlatness = 'spectral_flatness';
+  static const String lowConfidence = 'low_confidence';
+
+  /// Classifier threw during inference (interpreter not loaded, native-side
+  /// failure, unsupported model output dtype). The event is dropped rather
+  /// than emitted with empty labels because we want field reports to call
+  /// out classifier health explicitly — silent fallback to `Other` would
+  /// hide a broken model.
+  static const String classifierError = 'classifier_error';
 }
 
 /// Diagnostic record for a rejected event. Not persisted — surfaced only
@@ -75,6 +90,49 @@ class RejectedEvent {
       'reading=$reading)';
 }
 
+/// Phase 5 output: an accepted event together with its YAMNet labels and
+/// pre-computed top label. Surfaced on the `events` stream; consumed by
+/// the Phase 6 persistence layer (and any future encoder).
+///
+/// `pcm` carries the consumed PCM that was handed to the classifier — we
+/// went with option (b) from the §5.3 wire-up brief because `EventWindow`
+/// has no non-destructive int16 accessor, only `firstSamplesAsFloat32`
+/// (used earlier by the spectral probe) and the single-use `takePcm`. Once
+/// we consume `takePcm()` for classification, the window itself is sealed,
+/// so the int16 data lives here on `ClassifiedEvent` instead.
+class ClassifiedEvent {
+  final EventWindow window;
+
+  /// PCM consumed from `window.takePcm()` and reinterpreted as int16. The
+  /// downstream encoder reads from here, not from the (now-sealed)
+  /// `window`.
+  final Int16List pcm;
+
+  /// Curated label → confidence. Empty when classification was skipped
+  /// (null `classifier`) or the precision floor zeroed every class.
+  final Map<String, double> labels;
+
+  /// Top non-`Other` label, falling back to `('Other', otherScore)` when
+  /// no curated class survived. Pre-computed so the storage layer doesn't
+  /// have to re-derive it.
+  final String topLabel;
+  final double topScore;
+
+  const ClassifiedEvent({
+    required this.window,
+    required this.pcm,
+    required this.labels,
+    required this.topLabel,
+    required this.topScore,
+  });
+
+  @override
+  String toString() =>
+      'ClassifiedEvent(start=${window.startMs}, '
+      'duration=${window.durationMs}ms, '
+      'topLabel=$topLabel, topScore=${topScore.toStringAsFixed(3)})';
+}
+
 /// Orchestrates the Phase 4 pipeline. One instance per session; not
 /// reusable after `stop()` (broadcast controllers are closed).
 class RecorderService {
@@ -84,6 +142,12 @@ class RecorderService {
   final RingBuffer _ring;
   final Gate _gate;
   final SpectralProbe _probe;
+
+  /// Optional classifier callback. When null, classification is skipped
+  /// and accepted events are emitted with empty labels and `('Other',
+  /// 0.0)` as the top label. Production wires this to `yamnet.classify`;
+  /// the null path keeps unit tests free of native-tflite dependencies.
+  final Classifier? _classifier;
 
   /// Whether the spectral pre-filter is enabled for this session.
   /// Decided once at construction from `noiseFloor.madDbfs`. Per spec
@@ -98,12 +162,14 @@ class RecorderService {
     required RingBuffer ring,
     required Gate gate,
     required SpectralProbe probe,
+    required Classifier? classifier,
   })  : _noiseFloor = noiseFloor,
         _mic = mic,
         _slicer = slicer,
         _ring = ring,
         _gate = gate,
         _probe = probe,
+        _classifier = classifier,
         _filterEnabled =
             noiseFloor.madDbfs <= SpectralCfg.maxAmbientMadForFilter {
     // The gate's ring MUST be the same instance as the recorder's ring,
@@ -117,6 +183,10 @@ class RecorderService {
   }
 
   /// Construct with sensible defaults. Pass overrides for testing.
+  ///
+  /// `classifier` is optional. Production wires it to `yamnet.classify`
+  /// (after `Yamnet.load()` completes). When null, the §5.3 reject policy
+  /// is skipped; accepted events flow through with empty labels.
   factory RecorderService({
     required NoiseFloor noiseFloor,
     MicSource? mic,
@@ -124,6 +194,7 @@ class RecorderService {
     RingBuffer? ring,
     Gate? gate,
     SpectralProbe? probe,
+    Classifier? classifier,
   }) {
     final r = ring ?? RingBuffer(_ringBytes);
     final g = gate ??
@@ -139,20 +210,22 @@ class RecorderService {
       ring: r,
       gate: g,
       probe: probe ?? SpectralProbe(),
+      classifier: classifier,
     );
   }
 
   // ---- public streams ---------------------------------------------------
 
-  final StreamController<EventWindow> _eventsOut =
-      StreamController<EventWindow>.broadcast();
+  final StreamController<ClassifiedEvent> _eventsOut =
+      StreamController<ClassifiedEvent>.broadcast();
   final StreamController<RejectedEvent> _rejectionsOut =
       StreamController<RejectedEvent>.broadcast();
 
-  /// One entry per accepted event (passed pre-filter, ≥ minEventDurationMs).
-  /// PCM is included so downstream (encoder, classifier, EventRepo) does
-  /// not have to consult the ring.
-  Stream<EventWindow> get events => _eventsOut.stream;
+  /// One entry per accepted event (passed pre-filter and the YAMNet
+  /// reject policy, ≥ minEventDurationMs). The element carries the
+  /// `EventWindow` for context, the consumed PCM that the classifier saw,
+  /// the curated label → confidence map, and the pre-computed top label.
+  Stream<ClassifiedEvent> get events => _eventsOut.stream;
 
   /// Diagnostic stream of rejections. Not persisted.
   Stream<RejectedEvent> get rejections => _rejectionsOut.stream;
@@ -259,7 +332,7 @@ class RecorderService {
     if (!_filterEnabled) {
       // Noisy-ambient session: skip the spectral pre-filter, defer to
       // YAMNet downstream. Spec §4.2.
-      _emitEvent(win);
+      _classifyAndEmit(win, ev);
       return;
     }
 
@@ -269,7 +342,7 @@ class RecorderService {
       // measurement. Pass it through; the duration filter already
       // ensured ≥ minEventDurationMs of total audio, and YAMNet is
       // tolerant of 500 ms inputs (it pads internally).
-      _emitEvent(win);
+      _classifyAndEmit(win, ev);
       return;
     }
 
@@ -293,11 +366,90 @@ class RecorderService {
       return;
     }
 
-    _emitEvent(win);
+    _classifyAndEmit(win, ev);
   }
 
-  void _emitEvent(EventWindow win) {
-    if (!_eventsOut.isClosed) _eventsOut.add(win);
+  /// Run the §5.3 reject policy and emit the surviving event. Called from
+  /// `_onClose` after duration and (optional) spectral filters pass.
+  ///
+  /// When `_classifier` is null, classification is skipped and the event
+  /// is emitted with an empty label map and `('Other', 0.0)` as the top
+  /// label. This is the path taken in unit tests that don't want to drag
+  /// the native tflite library into the harness.
+  void _classifyAndEmit(EventWindow win, GateClosed ev) {
+    // Consume the event window's PCM exactly once. We need int16 for the
+    // classifier, and `EventWindow` only exposes Uint8 via `takePcm()` —
+    // see option (b) in the §5.3 wire-up brief / `ClassifiedEvent` doc.
+    //
+    // `BytesBuilder.takeBytes()` returns a freshly allocated `Uint8List`
+    // backed by a `ByteBuffer` at offset 0, so a zero-copy `Int16List.view`
+    // is safe here (no alignment surprises like `firstSamplesAsFloat32`
+    // hits when slicing a sub-view at an odd offset). Length is aligned
+    // down to an even byte count defensively — odd byte counts would
+    // mean a half-sample at the tail, which we discard.
+    final bytes = win.takePcm();
+    final samples = bytes.length >> 1;
+    final pcm = Int16List.view(bytes.buffer, bytes.offsetInBytes, samples);
+
+    final classifier = _classifier;
+    if (classifier == null) {
+      _emitEvent(ClassifiedEvent(
+        window: win,
+        pcm: pcm,
+        labels: const {},
+        topLabel: 'Other',
+        topScore: 0.0,
+      ));
+      return;
+    }
+
+    // Classifier failures (interpreter not loaded, native-side error,
+    // unsupported output dtype) must surface as a rejection rather than
+    // silently degrading to `Other` — a broken model should be loud in
+    // field reports, not invisible. The mic loop continues regardless;
+    // the next event gets a fresh attempt.
+    final Map<String, double> labels;
+    try {
+      labels = classifier(pcm);
+    } catch (_) {
+      _emitRejection(RejectedEvent(
+        ev.startMs,
+        ev.endMs,
+        RejectionReason.classifierError,
+        null,
+      ));
+      return;
+    }
+    final top = LabelMap.topLabel(labels);
+    // `top.score` is already a non-Other score by `topLabel`'s contract
+    // (`Other` is excluded from the contest, only used as the fallback
+    // when no curated class survived). So if the returned label is
+    // anything but 'Other', `maxCurated == top.score`; otherwise no
+    // curated class scored above zero.
+    final maxCurated = top.label == 'Other' ? 0.0 : top.score;
+    final otherScore = labels['Other'] ?? 0.0;
+    if (maxCurated < LabelCfg.minTopCuratedForKeep &&
+        otherScore > LabelCfg.maxOtherForKeep) {
+      _emitRejection(RejectedEvent(
+        ev.startMs,
+        ev.endMs,
+        RejectionReason.lowConfidence,
+        null,
+      ));
+      return;
+    }
+
+    _emitEvent(ClassifiedEvent(
+      window: win,
+      pcm: pcm,
+      labels: labels,
+      topLabel: top.label,
+      topScore: top.score,
+    ));
+  }
+
+  void _emitEvent(ClassifiedEvent ev) {
+    if (!_eventsOut.isClosed) _eventsOut.add(ev);
   }
 
   void _emitRejection(RejectedEvent rej) {

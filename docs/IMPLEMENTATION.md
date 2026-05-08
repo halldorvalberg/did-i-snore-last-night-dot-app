@@ -861,7 +861,10 @@ class EncodeQueue {
       // Drop oldest pending job; mark its DB row as deleted.
       final oldest = _queue.removeAt(0);
       debugLog.event('encode_dropped_overflow', {'id': oldest.eventId});
-      await eventRepo.softDelete(oldest.eventId, reason: 'encode_overflow');
+      await eventRepo.softDelete(oldest.eventId);
+      // Audit trail lives in the debug log via `encode_dropped_overflow`
+      // above — `EventRepo.softDelete` is intentionally narrow and does
+      // not carry a reason field.
     }
     _queue.add(job);
     _maybeStart();

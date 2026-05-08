@@ -34,6 +34,7 @@ import '../classifier/label_map.dart';
 import '../config/constants.dart';
 import '../data/event_repo.dart';
 import 'calibrator.dart';
+import 'encode_queue.dart';
 import 'energy.dart';
 import 'event_window.dart';
 import 'gate.dart';
@@ -165,6 +166,21 @@ class RecorderService {
   /// `path_provider` plugin shim.
   final EventRepo? _repo;
 
+  /// Optional encode queue. When non-null AND `_repo` is also non-null,
+  /// every accepted event flows through `insertPending` → queue submit
+  /// → encode → `markReady`. When null, the recorder stops at
+  /// `insertPending` and the row stays `pending` forever (or until the
+  /// 60-second sweep tears it down).
+  ///
+  /// Same nullable-injection pattern as `_repo`: tests pass null to
+  /// keep the encoder out of scope, production constructs both
+  /// together. The queue is NOT created internally because its
+  /// `Directory docsDir` argument requires `getApplicationDocumentsDirectory()`
+  /// which only works inside a Flutter binding — pushing the
+  /// construction up to the caller (`main.dart` or the controller in
+  /// Phase 8) keeps the recorder testable in pure Dart.
+  final EncodeQueue? _encodeQueue;
+
   /// Whether the spectral pre-filter is enabled for this session.
   /// Decided once at construction from `noiseFloor.madDbfs`. Per spec
   /// §4.2 the filter is a fan-rejector that fails in noisy ambients, so
@@ -180,6 +196,7 @@ class RecorderService {
     required SpectralProbe probe,
     required Classifier? classifier,
     required EventRepo? repo,
+    required EncodeQueue? encodeQueue,
   })  : _noiseFloor = noiseFloor,
         _mic = mic,
         _slicer = slicer,
@@ -188,6 +205,7 @@ class RecorderService {
         _probe = probe,
         _classifier = classifier,
         _repo = repo,
+        _encodeQueue = encodeQueue,
         _filterEnabled =
             noiseFloor.madDbfs <= SpectralCfg.maxAmbientMadForFilter {
     // The gate's ring MUST be the same instance as the recorder's ring,
@@ -214,6 +232,7 @@ class RecorderService {
     SpectralProbe? probe,
     Classifier? classifier,
     EventRepo? repo,
+    EncodeQueue? encodeQueue,
   }) {
     final r = ring ?? RingBuffer(_ringBytes);
     final g = gate ??
@@ -231,6 +250,7 @@ class RecorderService {
       probe: probe ?? SpectralProbe(),
       classifier: classifier,
       repo: repo,
+      encodeQueue: encodeQueue,
     );
   }
 
@@ -260,6 +280,15 @@ class RecorderService {
   StreamSubscription<Uint8List>? _sub;
   bool _running = false;
 
+  /// Outstanding `insertPending → submit` chains kicked off in
+  /// `_emitEvent`. Each future removes itself via `whenComplete` once it
+  /// resolves; `stop()` awaits `Future.wait(this set)` BEFORE draining the
+  /// encode queue so a gate-close that fired ~ms before stop() can't slip
+  /// past the drain barrier and leave its event in `pending` forever.
+  /// Without this, the unawaited insertPending could resolve AFTER drain()
+  /// has already returned (queue empty at the time it was checked).
+  final Set<Future<void>> _pendingInserts = <Future<void>>{};
+
   /// True between `start()` and `stop()`.
   bool get isRunning => _running;
 
@@ -272,8 +301,16 @@ class RecorderService {
     await _mic.start();
   }
 
-  /// Stops recording, drops any in-flight event window, and closes the
-  /// output streams. After `stop()` the service is not reusable.
+  /// Stops recording, drops any in-flight event window, drains the
+  /// encode queue, and closes the output streams. After `stop()` the
+  /// service is not reusable.
+  ///
+  /// **Order matters:** mic stops first (no new chunks → no new
+  /// gate-opens → no new `_emitEvent`), then we drain the queue so
+  /// already-accepted events finish encoding before we close the output
+  /// streams. Closing streams first would race a final emit against a
+  /// listener cancellation; draining first would race the mic against
+  /// a closed event sink.
   Future<void> stop() async {
     if (!_running) return;
     _running = false;
@@ -286,6 +323,23 @@ class RecorderService {
     // tail never closed. Drop it. Per spec §"Failure modes": "App
     // crashes mid-event → In-flight EventWindow is lost."
     _current = null;
+    // Drain the encode queue so events already accepted before stop()
+    // finish encoding rather than getting stuck in `pending` and waiting
+    // for the 60-second sweep. `drain()` resolves immediately if no
+    // queue was injected or the queue is already idle.
+    //
+    // Order: await any in-flight `insertPending → submit` chains FIRST
+    // so the queue actually sees the late submits before we drain. A
+    // gate-close that fires within ~ms of stop() leaves `_emitEvent`
+    // mid-future; without this barrier, the queue would be empty at
+    // drain time and the late submit would land on a queue nothing is
+    // waiting on. The encode would still run (FFmpegKit is independent
+    // of Dart lifecycle), but the docstring's "drain before close"
+    // contract would be silently weakened.
+    if (_pendingInserts.isNotEmpty) {
+      await Future.wait(_pendingInserts.toList());
+    }
+    await _encodeQueue?.drain();
     if (!_eventsOut.isClosed) await _eventsOut.close();
     if (!_rejectionsOut.isClosed) await _rejectionsOut.close();
   }
@@ -480,18 +534,45 @@ class RecorderService {
     // The `audioPath` here is the canonical layout from spec §6.3:
     // `events/YYYY-MM-DD/<startedAt>.opus`. Phase 7's encoder writes
     // the actual file at this path (via `<final>.tmp` → rename).
+    //
+    // Phase 7 wire-up: when `_encodeQueue` is non-null, chain the queue
+    // submit off the insert future so the queue sees a row id that
+    // already exists. Order matters: submitting before the row is
+    // committed could (in principle) race a `markReady` against an
+    // un-inserted row. The chain here keeps the mic hot path
+    // non-blocking — `insertPending` resolves on a microtask, then
+    // `submit` is a synchronous enqueue, then control returns. No
+    // `await` on the mic side.
     final repo = _repo;
     if (repo != null) {
       final relPath = _audioRelPathForEvent(ev);
-      // ignore: discarded_futures — fire-and-forget; see comment above.
-      repo
+      final queue = _encodeQueue;
+      // The chain is registered in `_pendingInserts` so `stop()` can
+      // await it before draining the encode queue. Fire-and-forget on
+      // the mic hot path (the chain awaits nothing on the producer side)
+      // but tracked at the lifecycle level.
+      late final Future<void> chain;
+      chain = repo
           .insertPending(
             startedAt: ev.window.startMs,
             endedAt: ev.window.startMs + ev.window.durationMs,
             durationMs: ev.window.durationMs,
             audioPath: relPath,
           )
-          .catchError((_) => -1);
+          .then((id) {
+            if (queue != null && id > 0) {
+              queue.submit(EncodeJob(
+                eventId: id,
+                pcm: ev.pcm,
+                relPath: relPath,
+                topLabel: ev.topLabel,
+                labels: ev.labels,
+              ));
+            }
+          })
+          .catchError((_) {})
+          .whenComplete(() => _pendingInserts.remove(chain));
+      _pendingInserts.add(chain);
     }
     if (!_eventsOut.isClosed) _eventsOut.add(ev);
   }

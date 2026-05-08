@@ -66,6 +66,42 @@ dependencies:
   path_provider: ^2.1.4
   path: ^1.9.0
 
+  # Phase 7 — Opus encoding. Path A (ffmpeg fork) per spec §7.1; Path B
+  # (libopus FFI) is deferred to Phase 7.5 if battery telemetry warrants.
+  #
+  # **Why this fork:** the original `ffmpeg_kit_flutter` was archived by
+  # arthenica.com in 2024 and is no longer accepting fixes. The maintained
+  # successor is `ffmpeg_kit_flutter_new` (publisher antonkarpenko.com),
+  # last released 6 months ago, FFmpeg 8.0, 20.6k weekly downloads, 150/160
+  # pub points, LGPL-3.0. Active issue tracker, Kotlin 1.8.22+ pin, Android
+  # API 24, iOS 14.0 minimums — all within our defaults.
+  #
+  # **Why the `_audio` sub-package, not the umbrella `_new`:** the umbrella
+  # is the full-GPL build (~50 MB AAR/framework) and we don't need video
+  # codecs. The `_audio` variant ships libopus alongside lame/libvorbis/
+  # speex/etc but drops x264/x265/libvpx entirely — materially smaller
+  # download (~25 MB on arm64) for the same `-c:a libopus` capability we
+  # need. LGPL-3.0, no GPL codecs, safe for a personal-use app. Default
+  # config does not enable network protocols (that's the `_https` family),
+  # so our `-i <local_pcm>` invocation can never resolve to a network URL.
+  #
+  # **Threading:** `FFmpegKit.execute()` returns `Future<FFmpegSession>`;
+  # the ffmpeg work runs on a native platform thread, not the Dart event
+  # loop. The encode queue can therefore drain serially on the main isolate
+  # without stalling the mic hot path. (Spec §7 says "worker isolate" but
+  # the example uses `await FFmpegKit.execute` directly — reading "worker
+  # isolate" as "off the mic loop", which native ffmpeg already provides.
+  # If device telemetry shows mic hiccups during encode, revisit and
+  # `Isolate.spawn` the queue's drain loop.)
+  #
+  # **Platform setup the Phase 1 native FGS will need to verify on device:**
+  #   - Android: `build.gradle.kts` Kotlin >= 1.8.22, minSdk >= 24, AAR
+  #     auto-resolves through Flutter's gradle plugin. No GPL flag toggle
+  #     needed (audio variant is LGPL-only).
+  #   - iOS: `Podfile` `platform :ios, '14.0'`. CocoaPods auto-resolves
+  #     the framework. No GPL flag toggle needed.
+  ffmpeg_kit_flutter_new_audio: ^2.0.0
+
   # NOTE: deps for later phases (flutter_background_service, workmanager,
   # flutter_local_notifications) are added per-phase to minimise
   # transitive dependency-resolution conflicts. The full v1 list lives in

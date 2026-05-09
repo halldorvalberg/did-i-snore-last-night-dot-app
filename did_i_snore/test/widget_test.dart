@@ -36,8 +36,12 @@ void main() {
       await tester.pumpWidget(const ProviderScope(child: App()));
       await tester.pumpAndSettle();
 
+      // Phase 8 — the bootstrap-era "Bootstrap only" headline was
+      // replaced with the recording controls. The title bar
+      // ("Did I Snore?") stays, and we now also have the big
+      // Start-recording button.
       expect(find.text('Did I Snore?'), findsOneWidget);
-      expect(find.text('Bootstrap only'), findsOneWidget);
+      expect(find.text('Start recording'), findsOneWidget);
     },
   );
 

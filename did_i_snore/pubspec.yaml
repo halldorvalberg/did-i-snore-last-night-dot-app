@@ -102,6 +102,23 @@ dependencies:
   #     the framework. No GPL flag toggle needed.
   ffmpeg_kit_flutter_new_audio: ^2.0.0
 
+  # Phase 8 — UI. `just_audio` plays the encoded `.opus` files in the
+  # player screen. Opus-in-Ogg is supported out of the box by the
+  # platform decoders just_audio wraps (ExoPlayer on Android, AVPlayer
+  # on iOS). We never transcode at playback time — the file on disk is
+  # the file we stream. `just_audio_background` is intentionally NOT a
+  # dep: this is a foreground player only (Phase 9 wakes the recorder
+  # via the native FGS, not the player).
+  #
+  # `intl` is a transitive dep of `flutter_localizations`, but the UI
+  # uses `DateFormat.MMMd()` / `DateFormat.Hm()` directly to render
+  # timeline date headers and tile timestamps in the device's locale
+  # (the only locale-sensitive surface in v1; copy is hardcoded English
+  # per spec §8 line 908). Pin explicitly so the import works without
+  # adding `flutter_localizations` to keep the bundle lean.
+  just_audio: ^0.9.40
+  intl: ^0.19.0
+
   # NOTE: deps for later phases (flutter_background_service, workmanager,
   # flutter_local_notifications) are added per-phase to minimise
   # transitive dependency-resolution conflicts. The full v1 list lives in

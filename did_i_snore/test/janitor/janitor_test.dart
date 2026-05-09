@@ -100,6 +100,39 @@ void main() {
       expect(await File(p.join(tempDir.path, rel)).exists(), isFalse);
     });
 
+    test(
+        'older-than-grace pending row + .peaks + .peaks.tmp: peaks '
+        'sidecars are also unlinked', () async {
+      // The peaks writer can crash mid-flight just like the opus
+      // encoder. A pending row that times out may leave any
+      // combination of `.opus`, `.opus.tmp`, `.peaks`, `.peaks.tmp` on
+      // disk — sweepPending must clean up all four.
+      const rel = 'events/2026-05-07/peaks-cleanup.opus';
+      const peaksRel = 'events/2026-05-07/peaks-cleanup.peaks';
+      await repo.insertPending(
+        startedAt: 1,
+        endedAt: 2,
+        durationMs: 1,
+        audioPath: rel,
+      );
+      final opus = await writeFile(rel);
+      final opusTmp = await writeFile('$rel.tmp');
+      final peaks = await writeFile(peaksRel);
+      final peaksTmp = await writeFile('$peaksRel.tmp');
+
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+
+      final count = await sweepPending(db, tempDir, olderThan: tinyGrace);
+      expect(count, 1);
+      expect(await opus.exists(), isFalse);
+      expect(await opusTmp.exists(), isFalse);
+      expect(await peaks.exists(), isFalse,
+          reason: 'sweepPending must derive the peaks path from audioPath '
+              'and unlink the .peaks sidecar');
+      expect(await peaksTmp.exists(), isFalse,
+          reason: 'sweepPending must also unlink the .peaks.tmp scratch');
+    });
+
     test('younger-than-grace pending row survives', () async {
       const rel = 'events/2026-05-07/123.opus';
       final id = await repo.insertPending(
@@ -207,17 +240,70 @@ void main() {
       expect(await tmp.exists(), isTrue);
     });
 
-    test('non-.opus / non-.tmp files in events/ are left alone', () async {
-      // Future Phase 7 sidecars (e.g. peaks.bin) live in the same partition
-      // and must not be nuked by this sweep — only `.opus` and `.tmp` are
-      // in scope.
-      const rel = 'events/2026-05-07/peaks.bin';
+    test('unknown-extension files in events/ are left alone', () async {
+      // Files with extensions outside the sweep's owned set (`.opus`,
+      // `.peaks`, `.tmp`) must not be touched. A user-dropped artifact
+      // or a future sidecar this sweep doesn't know about is the
+      // canonical case.
+      const rel = 'events/2026-05-07/notes.bin';
       final f = await writeFile(rel);
 
       final count = await sweepOrphans(db, tempDir);
       expect(count, 0);
       expect(await f.exists(), isTrue,
-          reason: 'extension filter must spare non-audio sidecars');
+          reason: 'extension filter must spare files outside the .opus / '
+              '.peaks / .tmp set');
+    });
+
+    test('peaks file matched to a row is preserved', () async {
+      // A row's audioPath implies a derived peaksPath via
+      // p.setExtension(audioPath, '.peaks'). The keep-set must include
+      // both, otherwise every orphan-sweep cycle would nuke every
+      // valid peaks sidecar.
+      const audioRel = 'events/2026-05-07/keep.opus';
+      const peaksRel = 'events/2026-05-07/keep.peaks';
+      await repo.insertPending(
+        startedAt: 1,
+        endedAt: 2,
+        durationMs: 1,
+        audioPath: audioRel,
+      );
+      final opus = await writeFile(audioRel);
+      final peaks = await writeFile(peaksRel);
+
+      final count = await sweepOrphans(db, tempDir);
+      expect(count, 0,
+          reason: 'a peaks file paired with a row in any state must NOT '
+              'be deleted by the orphan sweep');
+      expect(await opus.exists(), isTrue);
+      expect(await peaks.exists(), isTrue);
+    });
+
+    test('orphan peaks file with no matching row is unlinked', () async {
+      // The mirror case: a stray `.peaks` whose row has been gone
+      // (orphan after a pending sweep beat the orphan sweep, or
+      // anything that left a sidecar dangling) must be unlinked.
+      const peaksRel = 'events/2026-05-07/orphan.peaks';
+      final f = await writeFile(peaksRel);
+
+      final count = await sweepOrphans(db, tempDir);
+      expect(count, 1,
+          reason: 'a .peaks file with no matching row in the DB is an '
+              'orphan and must be unlinked');
+      expect(await f.exists(), isFalse);
+    });
+
+    test('orphan peaks .tmp scratch is unlinked', () async {
+      // A peaks-writer crash before the rename leaves a `.peaks.tmp`.
+      // With no matching row (the pending sweep already tore it down),
+      // it's an orphan.
+      const peaksTmpRel = 'events/2026-05-07/orphan.peaks.tmp';
+      final f = await writeFile(peaksTmpRel);
+
+      final count = await sweepOrphans(db, tempDir);
+      expect(count, 1,
+          reason: 'a stray .peaks.tmp with no row is an orphan');
+      expect(await f.exists(), isFalse);
     });
 
     test('returns 0 when the events/ directory does not exist', () async {

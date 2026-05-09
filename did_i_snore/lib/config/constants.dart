@@ -87,6 +87,37 @@ class EncoderCfg {
   static const int encodeQueueMaxDepth = 8;
 }
 
+/// Peaks sidecar — Spec §6.4 lines 816–818. The encoder writes a
+/// downsampled peak-per-pixel array next to each `.opus` event so the
+/// Phase 8 player can render the waveform tile instantly without
+/// loading and decoding the full audio.
+///
+/// **File format (single source of truth — the player reads this
+/// byte-for-byte; do not change without coordinating with the player):**
+///
+/// - `peakCount × float32 little-endian`. No header, no version byte,
+///   no trailer. Total file size is exactly `peakCount * 4` bytes
+///   (200 × 4 = 800 with the current constant).
+/// - Each value is the absolute peak amplitude in `[0.0, 1.0]`, derived
+///   by taking `max(abs(s)) / 32768.0` over the corresponding slice of
+///   int16 PCM.
+/// - The count is **constant regardless of event duration** so the
+///   player's tile width is fixed: short events get more PCM samples
+///   per peak, long events get fewer; the peak count stays at
+///   `peakCount` either way.
+/// - Endianness: Dart's `Float32List` is host-endian, and every device
+///   we ship to (iOS arm64, Android arm64-v8a / armeabi-v7a) is
+///   little-endian. The peaks writer documents this assumption.
+class PeaksCfg {
+  /// Fixed peak count per event. Player tile width is constant.
+  static const int peakCount = 200;
+
+  /// Sidecar extension. Lives next to the `.opus` file in the same
+  /// day-partition directory (`events/YYYY-MM-DD/<ts>.peaks`) so the
+  /// `.tmp` + rename is same-filesystem atomic.
+  static const String peaksExtension = '.peaks';
+}
+
 class DebugCfg {
   static const int logMaxBytes = 2 * 1024 * 1024;
   static const int logFlushIntervalSec = 5;

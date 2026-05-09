@@ -71,14 +71,24 @@ const Duration kPendingGrace =
     Duration(seconds: RetentionCfg.pendingGraceSeconds);
 
 /// Pending sweep — DELETE rows where `state='pending' AND createdAt <
-/// now - olderThan`. For each deleted row, also `unlink` the file at
-/// `<docsDir>/<audioPath>` and `<docsDir>/<audioPath>.tmp` if either
-/// exists.
+/// now - olderThan`. For each deleted row, also `unlink`:
+///
+/// - `<docsDir>/<audioPath>` (final `.opus`)
+/// - `<docsDir>/<audioPath>.tmp` (in-flight encode scratch)
+/// - `<docsDir>/<peaksPath>` (peaks sidecar, derived from `audioPath`
+///   via `p.setExtension(audioPath, PeaksCfg.peaksExtension)`)
+/// - `<docsDir>/<peaksPath>.tmp` (in-flight peaks scratch)
+///
+/// We derive the peaks path from `audioPath` rather than reading the
+/// `peaks_path` column because a pending row never reached `markReady`,
+/// so the column is null. The encoder + peaks writer use the canonical
+/// `audioRel`-with-swapped-extension shape, so the derivation is
+/// guaranteed to match what was on disk.
 ///
 /// Returns the number of rows deleted (NOT files unlinked — files are a
 /// side effect, the row count is the canonical signal).
 ///
-/// **Idempotent.** If the file is already gone (e.g. a previous run
+/// **Idempotent.** If a file is already gone (e.g. a previous run
 /// deleted it), the `if exists` guard skips the unlink. If the row is
 /// already gone (sweep ran in another isolate), the WHERE clause
 /// matches nothing.
@@ -105,13 +115,18 @@ Future<int> sweepPending(
 
   for (final row in stale) {
     final audioRel = row.audioPath;
-    final finalFile = File(p.join(docsDir.path, audioRel));
-    final tmpFile = File(p.join(docsDir.path, '$audioRel${PathsCfg.tmpSuffix}'));
-    if (await finalFile.exists()) {
-      await finalFile.delete();
-    }
-    if (await tmpFile.exists()) {
-      await tmpFile.delete();
+    final peaksRel =
+        p.setExtension(audioRel, PeaksCfg.peaksExtension);
+    final candidates = <File>[
+      File(p.join(docsDir.path, audioRel)),
+      File(p.join(docsDir.path, '$audioRel${PathsCfg.tmpSuffix}')),
+      File(p.join(docsDir.path, peaksRel)),
+      File(p.join(docsDir.path, '$peaksRel${PathsCfg.tmpSuffix}')),
+    ];
+    for (final f in candidates) {
+      if (await f.exists()) {
+        await f.delete();
+      }
     }
   }
 
@@ -122,8 +137,8 @@ Future<int> sweepPending(
 }
 
 /// Orphan sweep — walk `<docsDir>/events/YYYY-MM-DD/` and delete any
-/// `.opus` or `.tmp` file whose relative path is not the `audioPath`
-/// (or `audioPath + .tmp`) of a current row.
+/// `.opus`, `.peaks`, or `.tmp` file whose relative path is not paired
+/// with a current row.
 ///
 /// Returns the number of files unlinked.
 ///
@@ -137,17 +152,36 @@ Future<int> sweepPending(
 /// `kPendingGrace` survives the pending sweep, and its `.tmp` file
 /// would otherwise be classified as an orphan here. The "ANY row"
 /// inclusion guards against that.
+///
+/// Keep-set, derived per row from `audioPath` (the canonical anchor;
+/// peaks live next to opus with the extension swapped):
+///
+/// - `<audioPath>`              — final `.opus`
+/// - `<audioPath>.tmp`          — encode scratch
+/// - `<peaksPath>`              — final `.peaks` (derived via
+///   `p.setExtension(audioPath, PeaksCfg.peaksExtension)`)
+/// - `<peaksPath>.tmp`          — peaks scratch
+///
+/// Deriving peaks from `audioPath` rather than reading the
+/// `peaks_path` column keeps the keep-set complete even for rows
+/// where peaks generation failed (`peaks_path IS NULL`) — we still
+/// don't want to nuke a stale `.peaks` file the orphan sweep can't
+/// distinguish from a real one.
 Future<int> sweepOrphans(AppDb db, Directory docsDir) async {
   final eventsRoot = Directory(p.join(docsDir.path, PathsCfg.eventsDir));
   if (!await eventsRoot.exists()) return 0;
 
-  // Collect every `audioPath` (and its `.tmp` sibling) from the DB.
-  // `state` not constrained — see method doc.
+  // Collect every `audioPath` (and its `.tmp` sibling) plus the
+  // derived peaks paths from the DB. `state` not constrained — see
+  // method doc.
   final paths = await db.select(db.events).map((e) => e.audioPath).get();
   final keep = <String>{};
   for (final rel in paths) {
     keep.add(rel);
     keep.add('$rel${PathsCfg.tmpSuffix}');
+    final peaksRel = p.setExtension(rel, PeaksCfg.peaksExtension);
+    keep.add(peaksRel);
+    keep.add('$peaksRel${PathsCfg.tmpSuffix}');
   }
 
   var unlinked = 0;
@@ -161,14 +195,13 @@ Future<int> sweepOrphans(AppDb db, Directory docsDir) async {
       // shape as `audioPath`. `p.relative` handles trailing-slash
       // edge cases.
       final rel = p.relative(f.path, from: docsDir.path);
-      // Only consider `.opus` files and `.tmp` siblings — we don't
-      // want to nuke peaks files or future sidecars that happen to
-      // land in the same partition. Peaks files use a `.peaks`
-      // extension and are tracked by the (separate) `peaksPath`
-      // column in `markReady`; once Phase 7 lands they'll need their
-      // own keep-set in this sweep.
+      // Only consider files this sweep owns: `.opus`, `.peaks`, and
+      // `.tmp` siblings. Anything else (future sidecars we don't
+      // know about, user-dropped files) is left alone.
       final ext = p.extension(rel);
-      if (ext != PathsCfg.audioExtension && ext != PathsCfg.tmpSuffix) {
+      if (ext != PathsCfg.audioExtension &&
+          ext != PeaksCfg.peaksExtension &&
+          ext != PathsCfg.tmpSuffix) {
         continue;
       }
       if (keep.contains(rel)) continue;

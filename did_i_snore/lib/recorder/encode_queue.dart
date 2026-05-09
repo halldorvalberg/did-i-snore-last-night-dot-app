@@ -34,6 +34,21 @@
 /// shape is expected here. See `lib/recorder/opus_encoder.dart` library
 /// doc.
 ///
+/// **Peaks generation (Phase 8 enabling):** between a successful encode
+/// and `markReady`, the queue calls
+/// `lib/recorder/peaks_writer.dart::writeEventPeaks` to produce the
+/// `.peaks` sidecar. The peaks path stored on the row is
+/// `events/YYYY-MM-DD/<ts>.peaks` — i.e. the audio path with the
+/// extension swapped, NOT `<ts>.opus.peaks`. The player performs the
+/// same conversion at read time so this is a single convention. Peaks
+/// failure is **non-fatal**: the encoded `.opus` is already on disk, so
+/// a missing sidecar is a lost convenience (player falls back to a flat
+/// placeholder), not a broken event. The queue logs `peaks_failed`
+/// with `{id, error}` and proceeds with `peaksPath=null`.
+///
+/// **Log events:** `encode_dropped_overflow`, `encode_failed`,
+/// `encode_markready_missing`, `peaks_failed`.
+///
 /// **Constants discipline:** queue depth from
 /// `EncoderCfg.encodeQueueMaxDepth`. No inline `8`. `onLog` injection
 /// keeps the layer free of a real debug-log dependency until Phase 11
@@ -48,6 +63,7 @@ import 'dart:typed_data';
 import '../config/constants.dart';
 import '../data/event_repo.dart';
 import 'opus_encoder.dart';
+import 'peaks_writer.dart';
 
 /// One unit of work for the encode queue. Constructed in
 /// `RecorderService._emitEvent` after `repo.insertPending` resolves with
@@ -116,6 +132,15 @@ class EncodeQueue {
     required Directory docsDir,
   }) _encode;
 
+  /// Peaks-writer seam. Production calls `writeEventPeaks`; tests inject
+  /// a fake that throws to exercise the non-fatal failure path. Same
+  /// pattern as the encoder seam above.
+  final Future<String> Function({
+    required Int16List pcm,
+    required String audioRelPath,
+    required Directory docsDir,
+  }) _peaksWriter;
+
   /// FIFO of pending jobs. `Queue` (not `List`) so `removeFirst` is O(1)
   /// — the drop-oldest path runs on every submit, and we don't want it
   /// to be O(n) on a queue of `EncoderCfg.encodeQueueMaxDepth = 8` either.
@@ -145,11 +170,17 @@ class EncodeQueue {
       required String relPath,
       required Directory docsDir,
     })? encode,
+    Future<String> Function({
+      required Int16List pcm,
+      required String audioRelPath,
+      required Directory docsDir,
+    })? peaksWriter,
   })  : _repo = repo,
         _docsDir = docsDir,
         _onLog = onLog ?? _noopLogger,
         _maxDepth = maxDepth ?? EncoderCfg.encodeQueueMaxDepth,
-        _encode = encode ?? encodeEventToOpus;
+        _encode = encode ?? encodeEventToOpus,
+        _peaksWriter = peaksWriter ?? writeEventPeaks;
 
   /// Number of jobs currently queued (not counting one in flight).
   /// Used by tests; not part of the production wire-up.
@@ -229,15 +260,32 @@ class EncodeQueue {
             relPath: job.relPath,
             docsDir: _docsDir,
           );
-          // Encode + atomic rename succeeded. Flip the row to
-          // `state='ready'`. Peaks are deferred to Phase 8 — pass null
-          // and let the player fall back to compute-on-the-fly until
-          // the peaks pipeline lands.
+          // Encode + atomic rename succeeded. Generate the peaks
+          // sidecar before flipping the row to `ready` so a successful
+          // `markReady` always points at a valid (or null) peaks path.
+          //
+          // Peaks failure is **non-fatal**: the `.opus` is already on
+          // disk, so a missing sidecar is a lost convenience (player
+          // falls back to a placeholder), not a broken event. We log
+          // `peaks_failed` and proceed with `peaksPath=null`.
+          String? peaksPath;
+          try {
+            peaksPath = await _peaksWriter(
+              pcm: job.pcm,
+              audioRelPath: job.relPath,
+              docsDir: _docsDir,
+            );
+          } catch (e) {
+            _onLog('peaks_failed', {
+              'id': job.eventId,
+              'error': e.toString(),
+            });
+          }
           final ok = await _repo.markReady(
             id: job.eventId,
             topLabel: job.topLabel,
             labelsJson: EventRepo.encodeLabels(job.labels),
-            peaksPath: null,
+            peaksPath: peaksPath,
           );
           if (!ok) {
             // The row was already gone — almost certainly the pending

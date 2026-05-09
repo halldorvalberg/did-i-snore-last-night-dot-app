@@ -31,6 +31,36 @@ typedef _LogCall = ({String event, Map<String, Object?> fields});
 /// One invocation of the fake encoder, captured for ordering assertions.
 typedef _EncodeCall = ({String relPath, int pcmLen});
 
+/// One invocation of the fake peaks writer.
+typedef _PeaksCall = ({String audioRelPath, int pcmLen});
+
+/// Builds a fake peaks writer closure that records every call into
+/// [calls]; if [shouldThrow] returns true for the call index, the
+/// closure throws (exercising the queue's non-fatal failure path).
+/// On success it returns the same `events/YYYY-MM-DD/<ts>.peaks` shape
+/// the production writer would.
+Future<String> Function({
+  required Int16List pcm,
+  required String audioRelPath,
+  required Directory docsDir,
+}) _buildFakePeaksWriter({
+  required List<_PeaksCall> calls,
+  bool Function(int callIndex)? shouldThrow,
+}) {
+  return ({
+    required Int16List pcm,
+    required String audioRelPath,
+    required Directory docsDir,
+  }) async {
+    final idx = calls.length;
+    calls.add((audioRelPath: audioRelPath, pcmLen: pcm.length));
+    if (shouldThrow != null && shouldThrow(idx)) {
+      throw StateError('peaks-boom@$idx');
+    }
+    return p.setExtension(audioRelPath, '.peaks');
+  };
+}
+
 /// Builds a fake encoder closure that records every call into [calls],
 /// honours [shouldThrow] for per-invocation failure injection, and (on
 /// success) writes a tiny stub file at the canonical output path so a
@@ -120,15 +150,19 @@ void main() {
     test(
         'single submit: encoder invoked once with the right '
         '(pcm, relPath, docsDir); row reaches state=ready with labels '
-        'round-tripping through EventRepo.decodeLabels',
+        'round-tripping through EventRepo.decodeLabels and peaksPath '
+        'set to the .peaks-suffix sibling',
         () async {
       final calls = <_EncodeCall>[];
+      final peaksCalls = <_PeaksCall>[];
       final encoder = _buildFakeEncoder(calls: calls);
+      final peaksWriter = _buildFakePeaksWriter(calls: peaksCalls);
       final queue = EncodeQueue(
         repo: repo,
         docsDir: tempDir,
         onLog: logger,
         encode: encoder,
+        peaksWriter: peaksWriter,
       );
 
       final id = await _insertPending(repo, 'a');
@@ -145,20 +179,76 @@ void main() {
       expect(calls.single.pcmLen, 16,
           reason: 'fake job pcm is Int16List(16); the queue must not '
               'truncate or copy');
+      expect(peaksCalls, hasLength(1),
+          reason: 'a successful encode must trigger exactly one peaks-'
+              'writer call before markReady');
+      expect(peaksCalls.single.audioRelPath, 'events/2026-05-08/a.opus',
+          reason: 'peaks writer receives the audioRelPath, not the peaks '
+              'path — it does the conversion itself');
 
       final row = await repo.getById(id);
       expect(row, isNotNull);
       expect(row!.state, 'ready');
       expect(row.topLabel, 'Snoring');
-      expect(row.peaksPath, isNull,
-          reason: 'Phase 7 always writes peaksPath=null; peaks land in '
-              'Phase 8');
+      expect(row.peaksPath, 'events/2026-05-08/a.peaks',
+          reason: 'peaksPath is set by the writer return; shape is '
+              'audioPath with the extension swapped (NOT <ts>.opus.peaks)');
       expect(row.labelsJson, isNotNull);
       final decoded = EventRepo.decodeLabels(row.labelsJson);
       expect(decoded, {'Snoring': 0.71},
           reason: 'labels must round-trip via decodeLabels exactly');
       expect(logCalls, isEmpty,
           reason: 'happy path emits no log events');
+    });
+
+    test(
+        'peaks writer throws → markReady proceeds with peaksPath=null '
+        'and exactly one peaks_failed log fires',
+        () async {
+      // The .opus is already on disk after the encoder succeeds; a
+      // failing peaks writer must NOT prevent the row from reaching
+      // ready. The player will fall back to a placeholder.
+      final calls = <_EncodeCall>[];
+      final peaksCalls = <_PeaksCall>[];
+      final encoder = _buildFakeEncoder(calls: calls);
+      final peaksWriter = _buildFakePeaksWriter(
+        calls: peaksCalls,
+        shouldThrow: (_) => true,
+      );
+      final queue = EncodeQueue(
+        repo: repo,
+        docsDir: tempDir,
+        onLog: logger,
+        encode: encoder,
+        peaksWriter: peaksWriter,
+      );
+
+      final id = await _insertPending(repo, 'noPeaks');
+      queue.submit(_job(id: id, name: 'noPeaks'));
+      await queue.drain();
+
+      // Encode + peaks both invoked exactly once; row reaches ready
+      // with peaksPath null.
+      expect(calls, hasLength(1));
+      expect(peaksCalls, hasLength(1),
+          reason: 'queue must attempt peaks regardless of ultimate outcome');
+
+      final row = await repo.getById(id);
+      expect(row?.state, 'ready',
+          reason: 'peaks failure must NOT block state=ready — the .opus '
+              'is already on disk; missing peaks is a lost convenience, '
+              'not a broken event');
+      expect(row?.peaksPath, isNull,
+          reason: 'peaks failure → peaksPath stays null; player falls '
+              'back to a flat placeholder');
+
+      final peaksFails =
+          logCalls.where((c) => c.event == 'peaks_failed').toList();
+      expect(peaksFails, hasLength(1),
+          reason: 'exactly one peaks_failed log per failed write');
+      expect(peaksFails.single.fields['id'], id);
+      expect(peaksFails.single.fields['error'], contains('peaks-boom'),
+          reason: 'log payload surfaces e.toString() only — no PCM');
     });
 
     test(

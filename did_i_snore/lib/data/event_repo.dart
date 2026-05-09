@@ -173,6 +173,23 @@ class EventRepo {
         .write(EventsCompanion(deletedAt: Value(now)));
   }
 
+  /// Inverse of [softDelete]. Used by the player's undo-snackbar
+  /// (Phase 8 spec line 889) to roll back a soft delete that the user
+  /// regrets. Idempotent — if the row was never deleted (or has
+  /// already been undeleted) this is a no-op.
+  ///
+  /// **Hard-deletion race.** If Phase 9's `hardDelete` pass already
+  /// tore the row down (`deletedAt < now - hardDeleteAfterDays`), the
+  /// row no longer exists and this method silently does nothing. The
+  /// undo SnackBar's auto-dismiss is ~5 s, well inside the 1-day
+  /// `hardDeleteAfterDays` window, so this is theoretical — but the
+  /// idempotent shape keeps it safe.
+  Future<void> undelete(int id) async {
+    await (_db.update(_db.events)
+          ..where((e) => e.id.equals(id) & e.deletedAt.isNotNull()))
+        .write(const EventsCompanion(deletedAt: Value(null)));
+  }
+
   /// Toggles the star flag. Starred events are exempt from auto-prune
   /// + quota-under-pressure (Phase 9).
   Future<void> setStarred(int id, bool starred) async {

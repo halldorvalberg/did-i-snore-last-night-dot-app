@@ -34,14 +34,19 @@ void main() {
       SharedPreferences.setMockInitialValues({consentPrefsKey: true});
 
       await tester.pumpWidget(const ProviderScope(child: App()));
-      await tester.pumpAndSettle();
+      // The redesigned home has ambient breathing/pulse animations that
+      // never settle, so `pumpAndSettle` would time out — pump a couple
+      // of frames to clear the async prefs load instead.
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
-      // Phase 8 — the bootstrap-era "Bootstrap only" headline was
-      // replaced with the recording controls. The title bar
-      // ("Did I Snore?") stays, and we now also have the big
-      // Start-recording button.
+      // Phase 8 + design retrofit: the title bar ("Did I Snore?") stays;
+      // when not recording the hero shows the "Good night" greeting.
+      // (Prefs are empty here → no calibration → the record button is
+      // disabled and the hero prompts to calibrate.)
       expect(find.text('Did I Snore?'), findsOneWidget);
-      expect(find.text('Start recording'), findsOneWidget);
+      expect(find.text('Good night'), findsOneWidget);
+      expect(find.text('Calibrate your room to start'), findsOneWidget);
     },
   );
 

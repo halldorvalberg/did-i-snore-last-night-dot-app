@@ -21,8 +21,10 @@ import 'consent/consent_screen.dart';
 import 'consent/consent_state.dart';
 import 'data/db.dart' show Event;
 import 'ui/home/home_screen.dart';
+import 'ui/manage_storage/manage_storage_screen.dart';
 import 'ui/player/player_screen.dart';
 import 'ui/setup/calibration_screen.dart';
+import 'ui/theme/app_theme.dart';
 import 'ui/timeline/timeline_screen.dart';
 
 /// Named route for the calibration screen. Argument-free; lives under
@@ -36,6 +38,10 @@ const String timelineRoute = '/timeline';
 /// Named route for the player. Argument: `Event` — the row to play.
 const String playerRoute = '/player';
 
+/// Named route for Manage Storage (Phase 9). Argument-free; lives
+/// under `routes:` in the route table.
+const String manageStorageRoute = '/manage-storage';
+
 class App extends ConsumerWidget {
   const App({super.key});
 
@@ -46,22 +52,11 @@ class App extends ConsumerWidget {
     return MaterialApp(
       title: 'Did I Snore?',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          // Muted, calm slate-blue. Deliberately not vibrant — this is a
-          // sleep-companion app, not a kid's game.
-          seedColor: const Color(0xFF4F6D8A),
-          brightness: Brightness.light,
-        ),
-      ),
-      darkTheme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF4F6D8A),
-          brightness: Brightness.dark,
-        ),
-      ),
+      // Dark-only by design — used in a dark bedroom and a groggy morning.
+      // The "Did I Snore?" design tokens live in `lib/ui/theme/`.
+      theme: AppTheme.dark(),
+      darkTheme: AppTheme.dark(),
+      themeMode: ThemeMode.dark,
       home: switch (consent) {
         ConsentState.unknown => const _LoadingScreen(),
         ConsentState.notGiven => const ConsentScreen(),
@@ -69,6 +64,7 @@ class App extends ConsumerWidget {
       },
       routes: {
         calibrationRoute: (_) => const CalibrationScreen(),
+        manageStorageRoute: (_) => const ManageStorageScreen(),
       },
       onGenerateRoute: (settings) {
         switch (settings.name) {

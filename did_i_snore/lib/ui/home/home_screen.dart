@@ -104,6 +104,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void _openManageStorage() =>
       Navigator.of(context).pushNamed(manageStorageRoute);
 
+  void _openOemOnboarding() =>
+      Navigator.of(context).pushNamed(oemOnboardingRoute);
+
   String _formatElapsed(Duration d) {
     final h = d.inHours.toString().padLeft(2, '0');
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
@@ -144,6 +147,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             _Header(
               onStorage: _openManageStorage,
               onSettings: _openCalibration,
+              onKeepAlive: _openOemOnboarding,
             ),
             Expanded(
               child: SingleChildScrollView(
@@ -208,10 +212,20 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
 /// Top bar: brand on the left, storage + settings on the right.
 class _Header extends StatelessWidget {
-  const _Header({required this.onStorage, required this.onSettings});
+  const _Header({
+    required this.onStorage,
+    required this.onSettings,
+    required this.onKeepAlive,
+  });
 
   final VoidCallback onStorage;
   final VoidCallback onSettings;
+
+  /// Re-opens the OEM "keep recording alive" onboarding (Phase 10.1). The
+  /// flow is auto-surfaced once on first Android launch; this is the
+  /// re-accessible entry point so the user can revisit the battery /
+  /// autostart steps any time.
+  final VoidCallback onKeepAlive;
 
   @override
   Widget build(BuildContext context) {
@@ -241,6 +255,7 @@ class _Header extends StatelessWidget {
             ),
           ),
           const Spacer(),
+          _IconBtn(icon: Icons.shield_moon_outlined, onTap: onKeepAlive),
           _IconBtn(icon: Icons.sd_storage_outlined, onTap: onStorage),
           _IconBtn(icon: Icons.tune_rounded, onTap: onSettings),
         ],

@@ -176,6 +176,65 @@ Calibration confirms PCM reaches Dart over the `EventChannel`.
 Still to verify in a real overnight soak: FGS survival across screen-lock +
 Doze for 8 h, and no slow byte-rate leak (the §1.3 / §1.4 soak criteria).
 
+## Phase 10.1 — Android OEM onboarding
+
+The OEM "keep recording alive" screen (`lib/ui/setup/oem_onboarding.dart`)
+requests the battery-optimization whitelist via `permission_handler` and
+deep-links into vendor autostart/battery activities via the native
+`app.didisnorelastnight/oem` channel. None of these can be exercised in the
+widget tests — the system dialog and the Settings deep-link are real OS UI.
+Run these on a real device, **unlocked**.
+
+### 1. First-launch auto-surface + render
+
+1. Fresh install (or clear `did_i_snore.oem_onboarding_seen` in
+   `shared_prefs/FlutterSharedPreferences.xml` via `adb shell run-as`).
+2. Grant consent so the gate flips to Home (`ConsentState.given`).
+3. Expected: on first reach of Home (Android only), the OEM onboarding
+   screen is **pushed once** over Home. Title "Keep recording alive",
+   intro "Your phone may kill the recorder overnight", a Step-1 card
+   "Allow unrestricted background activity", and — on the Nothing 3a — a
+   vendor card "Nothing OS — app battery management".
+4. Tap **Done — back to recording** (or "I'll test it tonight"). Expected:
+   pops to Home; `oem_onboarding_seen=true` is written; relaunching does
+   NOT show it again. Re-open it from the Home header (shield-moon icon).
+
+### 2. Battery-optimization whitelist (the load-bearing step)
+
+1. On the Step-1 card, tap **Allow background activity**.
+2. Expected: the system "Allow app to run in the background without
+   restrictions?" dialog appears. Choose **Allow**.
+3. Return to the app. Expected: the card flips to a **Done** pill with a
+   check (the lifecycle-resume re-reads
+   `Permission.ignoreBatteryOptimizations.status`); the action button is
+   gone. This is the single most important step on OneOS.
+
+### 3. OEM deep-link "Open settings"
+
+1. On the **Nothing OS** vendor card, tap **Open settings**.
+2. Expected: a Settings screen opens. Nothing/OneOS has no dedicated
+   autostart activity in our `OemSettings` table, so the native side falls
+   back to **App details** for this package (and shows the SnackBar
+   "Opened app settings — follow the steps below from there."). From there
+   follow the written steps (Battery → App battery management →
+   unrestricted). The fallback is by design — the never-crash contract:
+   the app-details page always resolves even when a vendor activity does not.
+3. On a Xiaomi/Oppo/etc. device, the same button should land directly on
+   the vendor autostart activity (no SnackBar) — verify the deep-link
+   resolves before relying on it for that OEM.
+
+**Partial verification on `c3c79b5c` (Nothing Phone 3a, Android 16,
+2026-06-10).** `flutter analyze` clean, full `flutter test` green (incl. the
+new `oem_steps_test.dart` mapping tests and `oem_onboarding_test.dart` widget
+smoke tests), `flutter build apk --debug` built, APK installed with
+`adb install -r`. App launched as the resumed `MainActivity` with **no
+`MissingPluginException` and no native crash** in logcat (the OEM
+`MethodChannel` registers alongside the recorder channel without error).
+The device was under a **secure keyguard** during the session, so the
+on-screen rendering and the live system-dialog / deep-link taps (steps 1–3
+above) could **not** be driven from `adb` — they remain to be confirmed by a
+human with the device unlocked.
+
 ## Reporting failures
 
 If any of the above fails, do **not** continue to Phase 2. File a note in

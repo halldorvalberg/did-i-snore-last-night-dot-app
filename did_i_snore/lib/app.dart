@@ -24,6 +24,8 @@ import 'ui/home/home_screen.dart';
 import 'ui/manage_storage/manage_storage_screen.dart';
 import 'ui/player/player_screen.dart';
 import 'ui/setup/calibration_screen.dart';
+import 'ui/setup/oem_onboarding.dart';
+import 'ui/setup/oem_onboarding_state.dart';
 import 'ui/theme/app_theme.dart';
 import 'ui/timeline/timeline_screen.dart';
 
@@ -41,6 +43,12 @@ const String playerRoute = '/player';
 /// Named route for Manage Storage (Phase 9). Argument-free; lives
 /// under `routes:` in the route table.
 const String manageStorageRoute = '/manage-storage';
+
+/// Named route for the Android OEM onboarding screen (Phase 10.1).
+/// Argument-free; lives under `routes:`. Reachable two ways: auto-surfaced
+/// once after consent on first Android launch (via [_HomeGate]), and
+/// re-openable from Home.
+const String oemOnboardingRoute = '/setup/oem-onboarding';
 
 class App extends ConsumerWidget {
   const App({super.key});
@@ -60,11 +68,12 @@ class App extends ConsumerWidget {
       home: switch (consent) {
         ConsentState.unknown => const _LoadingScreen(),
         ConsentState.notGiven => const ConsentScreen(),
-        ConsentState.given => const HomeScreen(),
+        ConsentState.given => const _HomeGate(),
       },
       routes: {
         calibrationRoute: (_) => const CalibrationScreen(),
         manageStorageRoute: (_) => const ManageStorageScreen(),
+        oemOnboardingRoute: (_) => const OemOnboardingScreen(),
       },
       onGenerateRoute: (settings) {
         switch (settings.name) {
@@ -102,6 +111,43 @@ class App extends ConsumerWidget {
         return null;
       },
     );
+  }
+}
+
+/// Post-consent gate. Always renders [HomeScreen] (so the consent→home path
+/// and the existing widget tests are unaffected), and — only on Android, and
+/// only once — pushes the OEM onboarding screen over it on first reach.
+///
+/// Why a push-over-Home gate rather than swapping `home:`: Home is the right
+/// resting place, the onboarding is a one-time interstitial the user
+/// dismisses back to Home, and rendering Home underneath means the test host
+/// (non-Android, where [shouldShowOemOnboardingProvider] is always false)
+/// lands directly on Home with nothing pushed. The "seen" pref is flipped by
+/// the onboarding screen's Done CTA, so this fires at most once.
+class _HomeGate extends ConsumerStatefulWidget {
+  const _HomeGate();
+
+  @override
+  ConsumerState<_HomeGate> createState() => _HomeGateState();
+}
+
+class _HomeGateState extends ConsumerState<_HomeGate> {
+  /// Guards against pushing twice if the build re-runs while the async
+  /// "seen" pref is still resolving.
+  bool _pushed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    // Watch so that once the async "seen" pref resolves to `no` on Android,
+    // we get a rebuild and schedule the one-time push.
+    if (!_pushed && ref.watch(shouldShowOemOnboardingProvider)) {
+      _pushed = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        Navigator.of(context).pushNamed(oemOnboardingRoute);
+      });
+    }
+    return const HomeScreen();
   }
 }
 

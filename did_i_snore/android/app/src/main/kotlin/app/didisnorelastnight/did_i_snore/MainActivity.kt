@@ -57,5 +57,23 @@ class MainActivity : FlutterActivity() {
                     PcmBus.setSink(null)
                 }
             })
+
+        // OEM-settings deep-link channel (Phase 10.1). Separate from the
+        // recorder control channel above so the two concerns stay isolated.
+        // Handler + ComponentName table live in OemSettings; this just wires
+        // the "openOemSettings" method to it. The battery-optimization
+        // whitelist request goes through permission_handler on the Dart
+        // side, not here — only vendor autostart screens need a native
+        // deep-link (see OemSettings for the full rationale).
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, OemSettings.CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "openOemSettings" -> {
+                        val brand = call.argument<String>("brand")
+                        OemSettings.open(this, brand, result)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
     }
 }

@@ -10,6 +10,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- OEM onboarding (docs/IMPLEMENTATION.md §10.1). Lets the app pop the
+         system "allow unrestricted background activity?" dialog via
+         permission_handler's Permission.ignoreBatteryOptimizations — the
+         single most important step on Doze-aggressive ROMs (OneOS on the
+         Nothing Phone 3a). Does NOT grant network access. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!--
       Privacy stance: this app does not have the INTERNET permission.
       Audio captured at night never leaves the device by code; the only

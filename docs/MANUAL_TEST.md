@@ -122,6 +122,60 @@ Same as #1 but on a Samsung device after running the OEM-onboarding
 deep-link in Settings (Phase 10 will automate this; for Phase 1, do it by
 hand following `docs/IMPLEMENTATION.md` § 10.1).
 
+## Production native recorder (Android) — channel + FGS verification
+
+Verifies the §1.4 native `RecorderService` that replaces the Dart `record`
+plugin on Android. Run on the reference device (Nothing Phone 3a,
+`c3c79b5c`) after `flutter build apk --debug` + `adb install -r`. The
+`record` plugin path is unchanged on iOS and the test host, so this section
+is Android-only.
+
+Setup: `adb -s c3c79b5c logcat -c`, launch the app, then drive the UI to
+**Start** a recording (through consent → calibration if not yet done).
+`RecorderService` is `exported="false"`, so it can ONLY be started by the
+app's own `MethodChannel` (`app.didisnorelastnight/recorder` → `start`) — an
+`adb am start-foreground-service` attempt is correctly rejected with
+`Permission Denial: ... not exported`. Do not try to start it from adb.
+
+Pass criteria, from `adb -s c3c79b5c logcat`:
+
+- **No `MissingPluginException`** for `app.didisnorelastnight/recorder` or
+  `.../recorder/pcm` — confirms `MainActivity.configureFlutterEngine`
+  registered both channels.
+- **FGS promoted:** `RecorderService: ACTION_START received, spinning
+  recorder`, then the OS shows `isForeground=true types=0x80` for the
+  service in `dumpsys activity services app.didisnorelastnight.did_i_snore`
+  (`0x80` == `FOREGROUND_SERVICE_TYPE_MICROPHONE`), `startForegroundCount=1`.
+- **UNPROCESSED source actually delivered:** `RecorderService: recorder
+  started: source=9 ...` AND the AudioFlinger line `inputSource 9,
+  sampleRate 16000, format 0x1`. Source 9 == `MediaRecorder.AudioSource.UNPROCESSED`.
+- **No `ForegroundServiceDidNotStartInTimeException`** — the §1.4 bug-A
+  regression check. The synchronous `startForeground` in `onStartCommand`
+  must keep this from ever appearing.
+- **Stream flows to Dart:** the ongoing notification "Did I Snore? is
+  recording" appears, and the home-screen RMS meter moves — proving PCM
+  chunks cross the `EventChannel` (`PcmBus` → main-thread sink) into the
+  Dart pipeline.
+- **Clean stop:** tap Stop → `RecorderService: ACTION_STOP received`, the
+  notification clears, and the service leaves `dumpsys activity services`
+  (`stopForeground` + `stopSelf`). No zombie respawn.
+
+**Verified end-to-end on `c3c79b5c` (Nothing Phone 3a, Android 16, 2026-06-10).**
+Driving Calibration (which runs `MicSource`, now the native path on Android)
+produced, in logcat:
+- `ActivityManager: Background started FGS: Allowed ... act=app.didisnorelastnight.START`
+- `RecorderService: ACTION_START received, spinning recorder`
+- `AudioRecord: set: Building AudioRecord with attributes: source=9 flags=0x800`
+- `RecorderService: recorder started: source=9 sampleRate=16000`
+- `dumpsys activity services`: `isForeground=true foregroundId=1001
+  types=0x00000080` with the `ONGOING|ONLY_ALERT_ONCE|NO_CLEAR|FOREGROUND_SERVICE`
+  notification on channel `recorder`.
+No `MissingPluginException`, no native crash. The live RMS bar moving in
+Calibration confirms PCM reaches Dart over the `EventChannel`.
+
+Still to verify in a real overnight soak: FGS survival across screen-lock +
+Doze for 8 h, and no slow byte-rate leak (the §1.3 / §1.4 soak criteria).
+
 ## Reporting failures
 
 If any of the above fails, do **not** continue to Phase 2. File a note in

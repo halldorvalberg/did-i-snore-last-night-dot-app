@@ -2,6 +2,14 @@
     <!-- Mic capture. Request triggered at the end of the consent flow. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Native foreground recorder service (docs/IMPLEMENTATION.md §1.4).
+         FOREGROUND_SERVICE_MICROPHONE is required on Android 14+ to back the
+         microphone-typed FGS; POST_NOTIFICATIONS lets the ongoing recording
+         notification (which doubles as the mic indicator) show on Android 13+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!--
       Privacy stance: this app does not have the INTERNET permission.
       Audio captured at night never leaves the device by code; the only
@@ -37,6 +45,13 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Native AudioRecord-owning foreground service (§1.4). Microphone
+             type declared here AND in the startForeground() flags. Not
+             exported — only started from our own MainActivity. Same process. -->
+        <service
+            android:name=".RecorderService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

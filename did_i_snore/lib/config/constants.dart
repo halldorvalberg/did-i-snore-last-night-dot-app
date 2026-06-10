@@ -59,6 +59,15 @@ class RetentionCfg {
   /// encoder finishes well before this; anything older means the worker
   /// died between INSERT and `markReady`.
   static const int pendingGraceSeconds = 60;
+
+  /// Period at which the recorder writes a heartbeat timestamp to
+  /// `shared_preferences` while a session is active. The Phase 9 crash
+  /// detector reads this on next launch to compute the recording-gap
+  /// `endedAt` for the synthetic `recording_gaps` row. 30 s balances
+  /// "fine-grained gap end" against shared_preferences write traffic
+  /// during a multi-hour overnight session (~120 writes/hour). Spec
+  /// §9 lines 940–949.
+  static const int heartbeatIntervalSeconds = 30;
 }
 
 /// Filesystem layout under the application documents directory. Single

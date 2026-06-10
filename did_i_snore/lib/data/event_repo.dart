@@ -210,4 +210,28 @@ class EventRepo {
     return (_db.select(_db.events)..where((e) => e.id.equals(id)))
         .getSingleOrNull();
   }
+
+  /// Fetches every `state='ready' AND deletedAt IS NULL` row, ordered
+  /// by `startedAt DESC`. The Manage Storage screen calls this once
+  /// per refresh and groups in-memory by `nightOf(Event)` (Phase 8 day
+  /// boundary policy). Spec: `docs/IMPLEMENTATION.md` §9 lines 929–938.
+  ///
+  /// Why a one-shot fetch (not a `watch()`): the screen's bulk-delete
+  /// flow already invalidates the provider after every action; a live
+  /// stream would emit mid-loop while the user is staring at the
+  /// confirmation dialog and rebuild the list under their finger.
+  /// Snapshot semantics keep the screen stable for the duration of the
+  /// interaction.
+  ///
+  /// Excludes pending and soft-deleted rows the same way
+  /// [eventsForNightStream] does — Manage Storage is reasoning about
+  /// what the user *can see and reclaim*, not the state-machine
+  /// scratch space.
+  Future<List<Event>> allReadyEvents() async {
+    return (_db.select(_db.events)
+          ..where((e) =>
+              e.state.equals('ready') & e.deletedAt.isNull())
+          ..orderBy([(e) => OrderingTerm.desc(e.startedAt)]))
+        .get();
+  }
 }

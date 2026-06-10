@@ -34,6 +34,7 @@ import '../classifier/label_map.dart';
 import '../config/constants.dart';
 import '../data/event_repo.dart';
 import 'calibrator.dart';
+import 'crash_heartbeat.dart';
 import 'encode_queue.dart';
 import 'energy.dart';
 import 'event_window.dart';
@@ -187,6 +188,13 @@ class RecorderService {
   /// noisy sessions skip it entirely and rely on YAMNet alone.
   final bool _filterEnabled;
 
+  /// When true, `start()` writes the `session_started_at` marker and a
+  /// periodic `last_heartbeat_at` to `shared_preferences`, and `stop()`
+  /// flips to `last_clean_shutdown_at`. Tests that don't want to wire
+  /// the `shared_preferences` mock pass `false`. Production wires
+  /// `true` from the controller.
+  final bool _crashHeartbeatEnabled;
+
   RecorderService._({
     required NoiseFloor noiseFloor,
     required MicSource mic,
@@ -197,6 +205,7 @@ class RecorderService {
     required Classifier? classifier,
     required EventRepo? repo,
     required EncodeQueue? encodeQueue,
+    required bool crashHeartbeatEnabled,
   })  : _noiseFloor = noiseFloor,
         _mic = mic,
         _slicer = slicer,
@@ -206,6 +215,7 @@ class RecorderService {
         _classifier = classifier,
         _repo = repo,
         _encodeQueue = encodeQueue,
+        _crashHeartbeatEnabled = crashHeartbeatEnabled,
         _filterEnabled =
             noiseFloor.madDbfs <= SpectralCfg.maxAmbientMadForFilter {
     // The gate's ring MUST be the same instance as the recorder's ring,
@@ -233,6 +243,7 @@ class RecorderService {
     Classifier? classifier,
     EventRepo? repo,
     EncodeQueue? encodeQueue,
+    bool crashHeartbeatEnabled = false,
   }) {
     final r = ring ?? RingBuffer(_ringBytes);
     final g = gate ??
@@ -251,6 +262,7 @@ class RecorderService {
       classifier: classifier,
       repo: repo,
       encodeQueue: encodeQueue,
+      crashHeartbeatEnabled: crashHeartbeatEnabled,
     );
   }
 
@@ -280,6 +292,12 @@ class RecorderService {
   StreamSubscription<Uint8List>? _sub;
   bool _running = false;
 
+  /// Periodic heartbeat timer — writes `last_heartbeat_at` every
+  /// `RetentionCfg.heartbeatIntervalSeconds`. Started in `start()`,
+  /// cancelled in `stop()`. Null when crash heartbeat is disabled or
+  /// the recorder is idle.
+  Timer? _heartbeatTimer;
+
   /// Outstanding `insertPending → submit` chains kicked off in
   /// `_emitEvent`. Each future removes itself via `whenComplete` once it
   /// resolves; `stop()` awaits `Future.wait(this set)` BEFORE draining the
@@ -299,6 +317,25 @@ class RecorderService {
     _running = true;
     _sub = _mic.pcm16.listen(_onChunk);
     await _mic.start();
+    if (_crashHeartbeatEnabled) {
+      // Mark the session-start anchor BEFORE the first heartbeat
+      // fires so a crash within the first `heartbeatIntervalSeconds`
+      // still has a `session_started_at` to recover from.
+      // Fire-and-forget: the mic loop is already running and we don't
+      // want to block on a SharedPreferences write.
+      // ignore: discarded_futures — see comment above.
+      CrashHeartbeat.markSessionStarted();
+      _heartbeatTimer = Timer.periodic(
+        const Duration(
+          seconds: RetentionCfg.heartbeatIntervalSeconds,
+        ),
+        (_) {
+          // Fire-and-forget: heartbeat writes are fast and best-effort.
+          // ignore: discarded_futures — see comment above.
+          CrashHeartbeat.writeHeartbeat();
+        },
+      );
+    }
   }
 
   /// Stops recording, drops any in-flight event window, drains the
@@ -314,6 +351,8 @@ class RecorderService {
   Future<void> stop() async {
     if (!_running) return;
     _running = false;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     await _sub?.cancel();
     _sub = null;
     await _mic.stop();
@@ -342,6 +381,14 @@ class RecorderService {
     await _encodeQueue?.drain();
     if (!_eventsOut.isClosed) await _eventsOut.close();
     if (!_rejectionsOut.isClosed) await _rejectionsOut.close();
+    if (_crashHeartbeatEnabled) {
+      // Flip to "clean shutdown" so the next launch's crash detector
+      // sees no orphaned session. Awaited (unlike start()) because
+      // stop() is the slow path anyway — if shared_preferences hangs
+      // for some reason, we'd rather see a bug report than have the
+      // marker race the next start().
+      await CrashHeartbeat.markCleanShutdown();
+    }
   }
 
   // ---- hot path ---------------------------------------------------------

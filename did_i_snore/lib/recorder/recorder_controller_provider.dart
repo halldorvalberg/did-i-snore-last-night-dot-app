@@ -35,6 +35,8 @@ library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../janitor/quota.dart';
+import '../janitor/scheduler.dart';
 import '../ui/providers.dart';
 import 'calibrator_provider.dart';
 import 'encode_queue.dart';
@@ -123,8 +125,24 @@ class RecorderController extends StateNotifier<RecorderState> {
     }
 
     try {
+      final db = _ref.read(appDbProvider);
       final repo = _ref.read(eventRepoProvider);
       final docsDir = await _ref.read(docsDirProvider.future);
+
+      // Phase 9 quota gate: refuse to start if free disk is below
+      // `RetentionCfg.minFreeDiskMb` AND we can't free enough by
+      // pruning unstarred events. The check also surfaces the pruned
+      // count to telemetry; the UI reads `quotaResultProvider` for the
+      // banner text.
+      final quota = await checkQuota(db, docsDir);
+      if (!quota.canRecord) {
+        state = state.copyWith(
+          errorMessage: quota.blockReason ??
+              'Low storage — recording disabled.',
+        );
+        return;
+      }
+
       final yamnet = await _ref.read(yamnetProvider.future);
 
       final queue = EncodeQueue(repo: repo, docsDir: docsDir);
@@ -133,6 +151,7 @@ class RecorderController extends StateNotifier<RecorderState> {
         repo: repo,
         encodeQueue: queue,
         classifier: yamnet.classify,
+        crashHeartbeatEnabled: true,
       );
       await service.start();
       _service = service;
@@ -172,6 +191,14 @@ class RecorderController extends StateNotifier<RecorderState> {
         errorMessage: state.errorMessage,
       );
     }
+    // Phase 9 iOS-stop hook: kick a janitor cycle off the back of
+    // every clean stop. The helper is a no-op on Android (WorkManager
+    // owns cadence there). Fire-and-forget; we don't block the UI on
+    // a janitor cycle.
+    final db = _ref.read(appDbProvider);
+    final docsDir = await _ref.read(docsDirProvider.future);
+    // ignore: discarded_futures — fire-and-forget by design.
+    runOnRecorderStop(db: db, docsDir: docsDir);
   }
 
   /// Clear the one-shot error message after the UI surfaced it. See

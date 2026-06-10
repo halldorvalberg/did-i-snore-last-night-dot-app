@@ -119,7 +119,16 @@ dependencies:
   just_audio: ^0.9.40
   intl: ^0.19.0
 
-  # NOTE: deps for later phases (flutter_background_service, workmanager,
+  # Phase 9 — janitor scheduling. WorkManager is Android-only; on iOS
+  # the package compiles to no-ops (we don't register the worker on
+  # iOS — see `lib/janitor/scheduler.dart` rationale). The periodic
+  # task fires every `RetentionCfg.janitorIntervalHours` and runs
+  # `Janitor.runAll` from a platform-spawned isolate. WorkManager's
+  # 15-minute periodic minimum + Doze stretch is non-issue because
+  # `runAll` is idempotent. Spec §9 lines 963–966.
+  workmanager: ^0.9.0+3
+
+  # NOTE: deps for later phases (flutter_background_service,
   # flutter_local_notifications) are added per-phase to minimise
   # transitive dependency-resolution conflicts. The full v1 list lives in
   # docs/IMPLEMENTATION.md 0.2; each phase's slash command pulls in what
@@ -142,3 +151,18 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/
+
+  # Design-system fonts (vendored, OFL-licensed — no runtime fetch; the
+  # app has no network permission). Hanken Grotesk is the UI face; IBM
+  # Plex Mono carries times/durations/numbers. HankenGrotesk-Regular.ttf
+  # is the variable [wght] file — Flutter renders the requested
+  # FontWeight off the weight axis, so one file covers 400–700.
+  fonts:
+    - family: HankenGrotesk
+      fonts:
+        - asset: assets/fonts/HankenGrotesk-Regular.ttf
+    - family: IBMPlexMono
+      fonts:
+        - asset: assets/fonts/IBMPlexMono-Regular.ttf
+        - asset: assets/fonts/IBMPlexMono-Medium.ttf
+          weight: 500

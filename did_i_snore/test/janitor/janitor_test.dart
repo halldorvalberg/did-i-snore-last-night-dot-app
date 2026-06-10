@@ -422,14 +422,290 @@ void main() {
     });
   });
 
-  group('runAll', () {
-    test('exercises all three sweeps in one call; second call is (0,0,0)',
+  group('sweepHardDelete', () {
+    /// Insert a `state='ready'` row, then tombstone it with an explicit
+    /// `deletedAt`. The hard-delete sweep targets `deletedAt < cutoff`,
+    /// so tests need direct control over the timestamp.
+    Future<int> insertTombstoned(
+      String rel, {
+      required int deletedAtMs,
+      bool starred = false,
+    }) async {
+      final id = await repo.insertPending(
+        startedAt: 1,
+        endedAt: 2,
+        durationMs: 1,
+        audioPath: rel,
+      );
+      await repo.markReady(
+        id: id,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+      if (starred) await repo.setStarred(id, true);
+      await (db.update(db.events)..where((e) => e.id.equals(id))).write(
+        EventsCompanion(deletedAt: Value(deletedAtMs)),
+      );
+      return id;
+    }
+
+    test('row tombstoned past the cutoff: row + audio + peaks deleted',
         () async {
+      const rel = 'events/2026-05-07/old-tombstone.opus';
+      const peaksRel = 'events/2026-05-07/old-tombstone.peaks';
+      final id = await insertTombstoned(
+        rel,
+        // 2 days old — past the default 1-day cutoff.
+        deletedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 2 * 24 * 3600 * 1000,
+      );
+      final opus = await writeFile(rel);
+      final peaks = await writeFile(peaksRel);
+
+      final count = await sweepHardDelete(db, tempDir);
+      expect(count, 1);
+      expect(await repo.getById(id), isNull,
+          reason: 'hard-delete must remove the row entirely');
+      expect(await opus.exists(), isFalse,
+          reason: 'audio file must be unlinked');
+      expect(await peaks.exists(), isFalse,
+          reason: 'peaks sidecar must be unlinked');
+    });
+
+    test('row tombstoned within the cutoff survives', () async {
+      const rel = 'events/2026-05-07/young-tombstone.opus';
+      final id = await insertTombstoned(
+        rel,
+        // 1 hour old — well inside the default 1-day cutoff.
+        deletedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 3600 * 1000,
+      );
+      final f = await writeFile(rel);
+
+      final count = await sweepHardDelete(db, tempDir);
+      expect(count, 0);
+      expect(await repo.getById(id), isNotNull);
+      expect(await f.exists(), isTrue);
+    });
+
+    test('non-tombstoned ready row is invisible', () async {
+      // sweepHardDelete must NEVER touch a row that hasn't been
+      // soft-deleted, regardless of age. Auto-prune is what flips the
+      // tombstone first.
+      const rel = 'events/2026-05-07/live.opus';
+      final id = await repo.insertPending(
+        startedAt: 1,
+        endedAt: 2,
+        durationMs: 1,
+        audioPath: rel,
+      );
+      await repo.markReady(
+        id: id,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+      final f = await writeFile(rel);
+
+      final count = await sweepHardDelete(db, tempDir);
+      expect(count, 0,
+          reason: 'WHERE deletedAt IS NOT NULL excludes live rows');
+      expect(await repo.getById(id), isNotNull);
+      expect(await f.exists(), isTrue);
+    });
+
+    test('idempotent: a second run returns 0', () async {
+      const rel = 'events/2026-05-07/repeat.opus';
+      await insertTombstoned(
+        rel,
+        deletedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 2 * 24 * 3600 * 1000,
+      );
+      await writeFile(rel);
+
+      expect(await sweepHardDelete(db, tempDir), 1);
+      expect(await sweepHardDelete(db, tempDir), 0,
+          reason: 'no rows match → no-op on the second pass');
+    });
+
+    test('missing files do not throw — defensive if-exists guards',
+        () async {
+      // A tombstone that has no on-disk file (already-deleted, or
+      // missing-file sweep ran first) must hard-delete the row
+      // without throwing on the unlink.
+      const rel = 'events/2026-05-07/no-file.opus';
+      final id = await insertTombstoned(
+        rel,
+        deletedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 2 * 24 * 3600 * 1000,
+      );
+      // Deliberately do NOT write any file.
+
+      final count = await sweepHardDelete(db, tempDir);
+      expect(count, 1);
+      expect(await repo.getById(id), isNull);
+    });
+  });
+
+  group('sweepAutoPrune', () {
+    /// Insert a `state='ready'` row with an explicit `startedAt` so we
+    /// can position it on either side of the retention cutoff.
+    Future<int> insertReadyAt(
+      String rel, {
+      required int startedAtMs,
+      bool starred = false,
+    }) async {
+      final id = await repo.insertPending(
+        startedAt: startedAtMs,
+        endedAt: startedAtMs + 1,
+        durationMs: 1,
+        audioPath: rel,
+      );
+      await repo.markReady(
+        id: id,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+      if (starred) await repo.setStarred(id, true);
+      return id;
+    }
+
+    test('unstarred row older than retention is soft-deleted', () async {
+      const rel = 'events/2026-05-07/old.opus';
+      final id = await insertReadyAt(
+        rel,
+        // 30 days old — past the default 14-day retention.
+        startedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000,
+      );
+      final f = await writeFile(rel);
+
+      final count = await sweepAutoPrune(db);
+      expect(count, 1);
+      final row = await repo.getById(id);
+      expect(row, isNotNull,
+          reason: 'auto-prune is soft-delete; the row stays for the audit '
+              'trail');
+      expect(row!.deletedAt, isNotNull);
+      expect(await f.exists(), isTrue,
+          reason: 'auto-prune does NOT touch files; hard-delete clears '
+              'them on the next cycle');
+    });
+
+    test('starred row older than retention SURVIVES (non-negotiable)',
+        () async {
+      const rel = 'events/2026-05-07/starred-old.opus';
+      final id = await insertReadyAt(
+        rel,
+        startedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000,
+        starred: true,
+      );
+
+      final count = await sweepAutoPrune(db);
+      expect(count, 0,
+          reason: 'starred protection is non-negotiable in auto-prune');
+      final row = await repo.getById(id);
+      expect(row!.deletedAt, isNull);
+      expect(row.starred, isTrue);
+    });
+
+    test('unstarred row younger than retention survives', () async {
+      const rel = 'events/2026-05-07/young.opus';
+      final id = await insertReadyAt(
+        rel,
+        // 1 day old — well inside the default 14-day retention.
+        startedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 24 * 3600 * 1000,
+      );
+
+      final count = await sweepAutoPrune(db);
+      expect(count, 0);
+      expect((await repo.getById(id))!.deletedAt, isNull);
+    });
+
+    test('already-tombstoned row is NOT re-touched (deletedAt unchanged)',
+        () async {
+      const rel = 'events/2026-05-07/already-tombed.opus';
+      final id = await insertReadyAt(
+        rel,
+        startedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000,
+      );
+      await repo.softDelete(id);
+      final originalDeletedAt = (await repo.getById(id))!.deletedAt;
+
+      // Sleep so a buggy re-touch would shift the timestamp forward.
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+
+      final count = await sweepAutoPrune(db);
+      expect(count, 0,
+          reason: 'WHERE deletedAt IS NULL excludes already-tombstoned '
+              'rows');
+      expect((await repo.getById(id))!.deletedAt, originalDeletedAt);
+    });
+
+    test('idempotent: a second run returns 0', () async {
+      const rel = 'events/2026-05-07/repeat-prune.opus';
+      await insertReadyAt(
+        rel,
+        startedAtMs:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000,
+      );
+
+      expect(await sweepAutoPrune(db), 1);
+      expect(await sweepAutoPrune(db), 0,
+          reason: 'first run set deletedAt; the WHERE clause now skips '
+              'this row → no-op');
+    });
+  });
+
+  group('runAll', () {
+    test('exercises all five sweeps in one call; second call is all 0',
+        () async {
+      // (0) Hard-delete target: tombstoned row past cutoff + its file.
+      const hardRel = 'events/2026-05-07/hard.opus';
+      final hardId = await repo.insertPending(
+        startedAt: 1,
+        endedAt: 2,
+        durationMs: 1,
+        audioPath: hardRel,
+      );
+      await repo.markReady(
+        id: hardId,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+      await (db.update(db.events)..where((e) => e.id.equals(hardId)))
+          .write(EventsCompanion(
+        deletedAt: Value(
+          DateTime.now().millisecondsSinceEpoch - 2 * 24 * 3600 * 1000,
+        ),
+      ));
+      final hardFile = await writeFile(hardRel);
+
+      // (0b) Auto-prune target: unstarred ready row past retention.
+      const autoRel = 'events/2026-05-07/auto.opus';
+      final autoStartedAt =
+          DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000;
+      final autoId = await repo.insertPending(
+        startedAt: autoStartedAt,
+        endedAt: autoStartedAt + 1,
+        durationMs: 1,
+        audioPath: autoRel,
+      );
+      await repo.markReady(
+        id: autoId,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+
       // (a) Pending sweep target: pending row + final file, then age the
-      // row past the default grace by rewriting createdAt directly. (We
-      // can't pass an `olderThan` override through `runAll`, so we age
-      // the row instead — this also documents that runAll uses the
-      // production grace.)
+      // row past the default grace by rewriting createdAt directly.
       const pendingRel = 'events/2026-05-07/pending.opus';
       final pendingId = await repo.insertPending(
         startedAt: 1,
@@ -448,11 +724,17 @@ void main() {
       const orphanRel = 'events/2026-05-07/orphan.opus';
       final orphanFile = await writeFile(orphanRel);
 
-      // (c) Missing-file target: ready row, no file.
+      // (c) Missing-file target: ready row, no file. `startedAt` is
+      // RECENT so the auto-prune sweep doesn't double-tombstone it
+      // alongside the missing-file sweep — this test is verifying the
+      // five sweeps individually, so we want each to claim exactly
+      // one row.
       const missingRel = 'events/2026-05-07/missing.opus';
+      final recentStartedAt = DateTime.now().millisecondsSinceEpoch -
+          24 * 3600 * 1000; // 1 day ago
       final missingId = await repo.insertPending(
-        startedAt: 10,
-        endedAt: 20,
+        startedAt: recentStartedAt,
+        endedAt: recentStartedAt + 10,
         durationMs: 10,
         audioPath: missingRel,
       );
@@ -464,11 +746,19 @@ void main() {
       );
 
       final result = await runAll(db, tempDir);
+      expect(result.hardDeleted, 1, reason: 'old tombstone + file → 1');
+      expect(result.autoPruned, 1, reason: 'old unstarred ready → 1');
       expect(result.pending, 1, reason: 'aged pending row + file → 1');
       expect(result.orphan, 1, reason: 'unmatched file → 1');
       expect(result.missing, 1, reason: 'ready row with no file → 1');
 
       // Side effects materialised:
+      expect(await repo.getById(hardId), isNull,
+          reason: 'hard-delete tore the row down');
+      expect(await hardFile.exists(), isFalse,
+          reason: 'hard-delete unlinked the audio file');
+      expect((await repo.getById(autoId))!.deletedAt, isNotNull,
+          reason: 'auto-prune tombstoned the unstarred row');
       expect(await repo.getById(pendingId), isNull,
           reason: 'pending sweep hard-deleted the row');
       expect(await orphanFile.exists(), isFalse,
@@ -476,19 +766,71 @@ void main() {
       expect((await repo.getById(missingId))!.deletedAt, isNotNull,
           reason: 'missing-file sweep tombstoned the ready row');
 
-      // Second runAll — every sweep must be a no-op.
+      // Second runAll — every sweep must be a no-op. Note: the auto-
+      // pruned row from cycle 1 is now tombstoned with `deletedAt =
+      // now`, so the *next* hard-delete cutoff (now - 1 day) doesn't
+      // catch it — it has to wait one more cycle. Idempotency still
+      // holds for this cycle.
       final second = await runAll(db, tempDir);
+      expect(second.hardDeleted, 0);
+      expect(second.autoPruned, 0);
       expect(second.pending, 0);
       expect(second.orphan, 0);
       expect(second.missing, 0);
     });
 
-    test('returns (0, 0, 0) on a fresh empty docs dir + empty DB',
+    test('returns all-zero on a fresh empty docs dir + empty DB',
         () async {
       final result = await runAll(db, tempDir);
+      expect(result.hardDeleted, 0);
+      expect(result.autoPruned, 0);
       expect(result.pending, 0);
       expect(result.orphan, 0);
       expect(result.missing, 0);
+    });
+
+    test('runs hard-delete BEFORE auto-prune (spec order)', () async {
+      // The "spec order" matters: hard-delete clears already-tombstoned
+      // rows first, then auto-prune creates fresh tombstones. If the
+      // order were inverted, a row past retention would be tombstoned
+      // and IMMEDIATELY hard-deleted in the same cycle (skipping the
+      // user's ~1-day undo window).
+      //
+      // Verify: pre-stage a row past retention but NOT yet tombstoned.
+      // Run runAll. Confirm the row's deletedAt is recent (just-now,
+      // from auto-prune) and the row still exists (because hard-delete
+      // ran first and saw nothing to delete).
+      const rel = 'events/2026-05-07/order-check.opus';
+      final id = await repo.insertPending(
+        startedAt:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000,
+        endedAt:
+            DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000 + 1,
+        durationMs: 1,
+        audioPath: rel,
+      );
+      await repo.markReady(
+        id: id,
+        topLabel: 'Snoring',
+        labelsJson: '{}',
+        peaksPath: null,
+      );
+
+      final beforeMs = DateTime.now().millisecondsSinceEpoch;
+      final result = await runAll(db, tempDir);
+      final afterMs = DateTime.now().millisecondsSinceEpoch;
+
+      expect(result.hardDeleted, 0,
+          reason: 'no row was tombstoned before this cycle');
+      expect(result.autoPruned, 1,
+          reason: 'the row is past retention and now soft-deleted');
+      final row = await repo.getById(id);
+      expect(row, isNotNull,
+          reason: 'auto-prune soft-deletes; hard-delete waits for the '
+              'next cycle (proves order)');
+      expect(row!.deletedAt, isNotNull);
+      expect(row.deletedAt!, greaterThanOrEqualTo(beforeMs));
+      expect(row.deletedAt!, lessThanOrEqualTo(afterMs));
     });
   });
 }

@@ -1,10 +1,14 @@
-/// Recovery sweeps for the Phase 6 state machine.
+/// Recovery sweeps + retention passes.
 ///
-/// Spec: `docs/IMPLEMENTATION.md` §6.2 lines 797–803.
+/// Spec: `docs/IMPLEMENTATION.md` §6.2 lines 797–803 (state-machine
+/// recovery) and §9 lines 910–917 (retention passes). Phase 6 shipped
+/// the three state-machine sweeps; Phase 9 adds the two retention
+/// passes (hard-delete, auto-prune) and the runner that orchestrates
+/// all five.
 ///
 /// The DB row and the audio file are written separately. Without the
 /// state machine + ordered sweeps we get **orphans** (file, no row) and
-/// **dead rows** (row, no file). The three sweeps below cover every
+/// **dead rows** (row, no file). The five sweeps below cover every
 /// surviving failure mode:
 ///
 /// | Failure mode                                   | Caught by      |
@@ -16,22 +20,43 @@
 /// |   under current API but defended anyway)       |                |
 /// | Row in `ready`, file deleted out from under us | missing-file   |
 /// |   (user clears app data, OS evicts, etc.)     | sweep          |
+/// | Soft-deleted row tombstone older than          | hard-delete    |
+/// |   `RetentionCfg.hardDeleteAfterDays` survives  | sweep          |
+/// |   long after its file is reclaim-eligible      |                |
+/// | Unstarred ready row older than                 | auto-prune     |
+/// |   `RetentionCfg.defaultDays` is past the       | sweep          |
+/// |   user's review horizon                        |                |
 ///
-/// **Order matters:** pending → orphan → missing-file. The runner in
-/// [runAll] enforces this. Reasons:
+/// **Order matters:** hard-delete → auto-prune → pending → orphan →
+/// missing-file. The runner in [runAll] enforces this. Reasons:
 ///
-/// 1. **Pending first.** If a pending row's file made it to disk
+/// 1. **Hard-delete first.** Tombstones older than
+///    `RetentionCfg.hardDeleteAfterDays` exit the system entirely (row
+///    + audio file + peaks file). Running this first means the
+///    subsequent sweeps see fewer rows and the orphan sweep's keep-set
+///    is tighter. It also matters that hard-delete runs *before*
+///    auto-prune: hard-delete only targets rows the auto-prune of a
+///    previous cycle already tombstoned, so swapping the order would
+///    delay reclaim by exactly one cycle without any safety benefit.
+/// 2. **Auto-prune second.** Newly-tombstoned rows from this pass
+///    won't be hard-deleted until the *next* runAll (their `deletedAt`
+///    is now and the cutoff is `now - hardDeleteAfterDays`). The
+///    `starred=false` guard is enforced *here* — even quota pressure
+///    only takes the auto-prune path's "soft-delete oldest unstarred"
+///    behaviour. Starred rows are the user's "this matters" signal and
+///    survive every automatic path.
+/// 3. **Pending third.** If a pending row's file made it to disk
 ///    (rename succeeded but UPDATE died), the pending sweep deletes
 ///    BOTH the row AND the file in one atomic action. Running orphan
 ///    first would catch the file (it has no `state='ready'` row) and
 ///    delete it — and then the pending sweep would still try to
 ///    `unlink` it. Idempotent (we guard with `if exists`), but
 ///    wasteful, and the state-machine-as-truth ordering is clearer.
-/// 2. **Orphan second.** With pending rows + their files gone, every
+/// 4. **Orphan fourth.** With pending rows + their files gone, every
 ///    file under `events/YYYY-MM-DD/` should now correspond to a
 ///    `state='ready'` row. Orphan walks the filesystem and removes
 ///    files with no matching row.
-/// 3. **Missing-file last.** The DB → FS direction. If a `state=
+/// 5. **Missing-file last.** The DB → FS direction. If a `state=
 ///    'ready'` row's file is gone, we soft-delete the row. Last in the
 ///    order so we don't trip on a row whose file the pending sweep was
 ///    about to delete (would never happen because pending sweep targets
@@ -41,16 +66,22 @@
 /// **Idempotency.** Every sweep is safe to run twice. Pending uses
 /// `if (await file.exists())` guards before unlink; orphan does the
 /// same; missing-file uses the `deletedAt IS NULL` guard inherited from
-/// `EventRepo.softDelete`. Calling [runAll] twice in a row is
+/// `EventRepo.softDelete`; hard-delete uses the same guard before
+/// unlinking and a single DELETE-by-id batch for the rows; auto-prune
+/// uses `deletedAt IS NULL` so a second pass within the same retention
+/// cutoff sees no candidates. Calling [runAll] twice in a row is
 /// equivalent to calling it once.
 ///
-/// **Out of scope here (Phase 9):**
-/// - Auto-prune unstarred events older than `RetentionCfg.defaultDays`.
-/// - Hard-delete tombstoned rows older than `hardDeleteAfterDays`.
-/// - Quota-under-pressure (free-disk gate before recording).
-/// - Scheduling — WorkManager (Android) / `BGTaskScheduler` (iOS) /
-///   app-launch trigger. Phase 6 ships the pure functions; Phase 9
-///   wires them.
+/// **Phase 9 wiring (this file ships the pure functions):**
+/// - `lib/janitor/scheduler.dart` registers the WorkManager periodic
+///   on Android and exposes the app-launch + recorder-stop hook for
+///   iOS. Both call [runAll].
+/// - `lib/janitor/quota.dart` is the quota-under-pressure orchestrator
+///   that runs *before* recording starts; it uses the same auto-prune
+///   semantics (oldest unstarred first, starred protected) but unlinks
+///   the audio file synchronously rather than waiting for the next
+///   hard-delete cycle, because we need disk free *now* or recording
+///   refuses.
 library;
 
 import 'dart:io';
@@ -69,6 +100,17 @@ import '../data/db.dart';
 /// the sweep with a shorter window.
 const Duration kPendingGrace =
     Duration(seconds: RetentionCfg.pendingGraceSeconds);
+
+/// Default hard-delete window. Tombstones older than this become
+/// candidates for [sweepHardDelete]. Lives next to the seconds-form
+/// constant in [RetentionCfg] so the unit conversion is in one place.
+const Duration kHardDeleteAfter =
+    Duration(days: RetentionCfg.hardDeleteAfterDays);
+
+/// Default auto-prune retention window. Unstarred ready rows older than
+/// this become candidates for [sweepAutoPrune].
+const Duration kAutoPruneRetention =
+    Duration(days: RetentionCfg.defaultDays);
 
 /// Pending sweep — DELETE rows where `state='pending' AND createdAt <
 /// now - olderThan`. For each deleted row, also `unlink`:
@@ -249,17 +291,145 @@ Future<int> sweepMissingFiles(AppDb db, Directory docsDir) async {
   return missingIds.length;
 }
 
-/// Runs the three sweeps in spec order: pending → orphan → missing-file.
+/// Hard-delete sweep — removes rows whose `deletedAt` tombstone is
+/// older than `olderThan`, along with their on-disk audio + peaks
+/// files. Spec §9 line 914.
+///
+/// Targets `deletedAt IS NOT NULL AND deletedAt < now - olderThan`. For
+/// each row, unlinks (defensively, with `if exists` guards):
+///
+/// - `<docsDir>/<audioPath>` — final `.opus`
+/// - `<docsDir>/<audioPath>.tmp` — encode scratch (defensive: the
+///   pending sweep should already have cleaned these, but a soft-
+///   deleted row whose file later went missing could in principle
+///   leave one behind)
+/// - `<docsDir>/<peaksPath>` — peaks sidecar. Derived from `audioPath`
+///   when `peaksPath` is null (which is normal for tombstoned rows
+///   that came from a failed peaks-write — see Phase 7's `peaks_failed`
+///   path).
+/// - `<docsDir>/<peaksPath>.tmp` — peaks scratch (defensive)
+///
+/// Returns the number of rows deleted.
+///
+/// **Idempotent.** The WHERE clause matches nothing on the second pass
+/// because the rows are gone; `if exists` guards make the file unlinks
+/// safe to re-run.
+///
+/// **Why deriving peaks from audioPath here, even though the row has a
+/// `peaksPath` column:** the stored column may be null for two reasons
+/// — (a) the encoder ran in pre-Phase-7 builds that didn't write peaks,
+/// or (b) the Phase 7 peaks writer failed and the row was marked ready
+/// with `peaksPath=null`. In case (b) there could still be a partial
+/// `.peaks` or `.peaks.tmp` on disk. Deriving the path from `audioPath`
+/// makes the unlink side total over both cases. When the column IS
+/// non-null, the derived path matches it exactly (peaks are written
+/// next to the audio with the extension swapped) so we don't need both.
+Future<int> sweepHardDelete(
+  AppDb db,
+  Directory docsDir, {
+  Duration olderThan = kHardDeleteAfter,
+}) async {
+  final cutoff = DateTime.now().millisecondsSinceEpoch -
+      olderThan.inMilliseconds;
+  final stale = await (db.select(db.events)
+        ..where((e) =>
+            e.deletedAt.isNotNull() &
+            e.deletedAt.isSmallerThanValue(cutoff)))
+      .get();
+  if (stale.isEmpty) return 0;
+
+  for (final row in stale) {
+    final audioRel = row.audioPath;
+    final peaksRel =
+        p.setExtension(audioRel, PeaksCfg.peaksExtension);
+    final candidates = <File>[
+      File(p.join(docsDir.path, audioRel)),
+      File(p.join(docsDir.path, '$audioRel${PathsCfg.tmpSuffix}')),
+      File(p.join(docsDir.path, peaksRel)),
+      File(p.join(docsDir.path, '$peaksRel${PathsCfg.tmpSuffix}')),
+    ];
+    for (final f in candidates) {
+      if (await f.exists()) {
+        await f.delete();
+      }
+    }
+  }
+
+  final ids = stale.map((r) => r.id).toList();
+  await (db.delete(db.events)..where((e) => e.id.isIn(ids))).go();
+  return ids.length;
+}
+
+/// Auto-prune sweep — soft-deletes unstarred `state='ready'` rows whose
+/// `startedAt` is older than `retention`. Spec §9 line 915.
+///
+/// Sets `deletedAt = now`; the file stays on disk until the next
+/// hard-delete pass clears it. The two-step (auto-prune → hard-delete
+/// on a later cycle) gives the user a one-cycle grace to recover via
+/// "undelete" if they spot the loss; once the tombstone is past
+/// `RetentionCfg.hardDeleteAfterDays`, the file is reclaimed.
+///
+/// Returns the number of rows soft-deleted.
+///
+/// **Idempotent.** Already-tombstoned rows are skipped via the
+/// `deletedAt IS NULL` guard. A second pass within the same retention
+/// cutoff has nothing left to match.
+///
+/// **Starred protection — non-negotiable.** The WHERE clause is
+/// `starred = false`. Starred events are the user's "this matters"
+/// signal and survive every automatic path, including the quota-under-
+/// pressure orchestrator (which calls into this same protection — see
+/// `lib/janitor/quota.dart`). The `(starred, started_at)` composite
+/// index in `db.dart` was created for this query; its leading `starred`
+/// column lets SQLite skip the starred half of the table entirely.
+Future<int> sweepAutoPrune(
+  AppDb db, {
+  Duration retention = kAutoPruneRetention,
+}) async {
+  final cutoff = DateTime.now().millisecondsSinceEpoch -
+      retention.inMilliseconds;
+  final now = DateTime.now().millisecondsSinceEpoch;
+  // Starred protection lives in the WHERE clause — see method doc.
+  final updated = await (db.update(db.events)
+        ..where((e) =>
+            e.state.equals('ready') &
+            e.starred.equals(false) &
+            e.deletedAt.isNull() &
+            e.startedAt.isSmallerThanValue(cutoff)))
+      .write(EventsCompanion(deletedAt: Value(now)));
+  return updated;
+}
+
+/// Result of a [runAll] cycle — counts per sweep, in spec order.
+typedef JanitorRunResult = ({
+  int hardDeleted,
+  int autoPruned,
+  int pending,
+  int orphan,
+  int missing,
+});
+
+/// Runs the five sweeps in spec order: hard-delete → auto-prune →
+/// pending → orphan → missing-file. Spec §9 lines 912–917.
 ///
 /// Returns a record of per-sweep counts. The runner is itself
-/// idempotent (each sweep is). Phase 9 wires this onto
-/// `WorkManager`/`BGTaskScheduler` and the app-launch hook.
-Future<({int pending, int orphan, int missing})> runAll(
+/// idempotent (each sweep is). `lib/janitor/scheduler.dart` wires this
+/// onto WorkManager (Android) and the app-launch + recorder-stop hook
+/// (iOS).
+Future<JanitorRunResult> runAll(
   AppDb db,
   Directory docsDir,
 ) async {
+  final hardDeleted = await sweepHardDelete(db, docsDir);
+  final autoPruned = await sweepAutoPrune(db);
   final pending = await sweepPending(db, docsDir);
   final orphan = await sweepOrphans(db, docsDir);
   final missing = await sweepMissingFiles(db, docsDir);
-  return (pending: pending, orphan: orphan, missing: missing);
+  return (
+    hardDeleted: hardDeleted,
+    autoPruned: autoPruned,
+    pending: pending,
+    orphan: orphan,
+    missing: missing,
+  );
 }

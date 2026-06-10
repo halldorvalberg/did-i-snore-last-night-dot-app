@@ -176,6 +176,62 @@ Calibration confirms PCM reaches Dart over the `EventChannel`.
 Still to verify in a real overnight soak: FGS survival across screen-lock +
 Doze for 8 h, and no slow byte-rate leak (the §1.3 / §1.4 soak criteria).
 
+## Production interruption → RecordingGap (Android)
+
+Verifies the Android equivalent of the iOS §10.2 interruption handling: a
+phone call (or anything that silences our `AudioRecord` — concurrent capture,
+privacy mic-mute) is detected in the native `RecorderService` via
+`AudioManager.registerAudioRecordingCallback` → `isClientSilenced`, and the
+Dart `RecorderService` writes one `recording_gaps` row (`reason=interruption`)
+covering the dead period. Detection is privacy-respecting: NO `READ_PHONE_STATE`,
+NO `PhoneStateListener`, NO audio focus (the passive-recorder contract, §1.2).
+Bluetooth route changes are deferred — a BT route change does not silence
+`AudioRecord` on Android, so `reason='route_change'` is out of scope here.
+
+Run on `c3c79b5c` (Nothing Phone 3a) after `flutter build apk --debug` +
+`adb -s c3c79b5c install -r`. Needs a second phone to place the call.
+
+Setup: `adb -s c3c79b5c logcat -c`, launch the app, drive the UI to **Start**
+a recording (through consent → calibration if not yet done).
+
+Steps:
+
+1. Confirm recording is live (ongoing notification + RMS meter moving).
+2. From a second phone, call the test phone.
+3. Answer the call, hold for ~15 s, then hang up.
+4. Continue recording for at least 1 more minute, then **Stop**.
+5. Open the timeline for the night just recorded.
+
+Pass criteria, from `adb -s c3c79b5c logcat`:
+
+- **`RecorderService: registered AudioRecordingCallback (sessionId=...)`**
+  appears once shortly after `recorder started` — the watcher is live.
+- On the call connecting: **`RecorderService: silenced-began atMs=<t0>
+  (mic taken — call/preempt/mute)`**.
+- On hang-up / the mic returning: **`RecorderService: silenced-ended
+  atMs=<t1> (mic returned)`**, with `t1 - t0` ≈ the call duration (~15 s).
+- **No `MissingPluginException`** for `app.didisnorelastnight/recorder/events`
+  — confirms the new `EventChannel` registered in `MainActivity`.
+- **One `GapTile`** in the timeline for that night, spanning ≈ `[t0, t1]`,
+  rendered from a `recording_gaps` row with `reason='interruption'`.
+- **Recording resumes** after the call: the RMS meter moves again and the
+  ongoing notification is still present (we never tear down the FGS for an
+  interruption — only the mic goes briefly deaf).
+- **Clean unregister on stop:** `RecorderService: unregistered
+  AudioRecordingCallback` on the Stop drain.
+
+Edge case worth a second pass: **stop during a call.** Start, place a call,
+and tap Stop while still on the call (mid-interruption, no `silenced-ended`
+yet). Expect the Dart side to close the gap from `silenced-began` to the stop
+instant — one `recording_gaps` row whose `endedAt` ≈ Stop time. The native
+service deliberately does NOT synthesize a `silenced-ended` on a clean stop
+(the mic never actually resumed), so this Dart-side close is the only writer
+for that final dead period.
+
+**Partial verification status — TO BE CONFIRMED ON DEVICE.** See the build +
+install note below; the live phone-call drive could not be run from `adb`
+under a secure keyguard and is left for a human with the device unlocked.
+
 ## Phase 10.1 — Android OEM onboarding
 
 The OEM "keep recording alive" screen (`lib/ui/setup/oem_onboarding.dart`)

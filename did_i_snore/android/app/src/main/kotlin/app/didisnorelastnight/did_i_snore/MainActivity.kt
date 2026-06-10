@@ -13,6 +13,7 @@ class MainActivity : FlutterActivity() {
         // Must match the channel names in lib/recorder/mic_source.dart.
         private const val METHOD_CHANNEL = "app.didisnorelastnight/recorder"
         private const val EVENT_CHANNEL = "app.didisnorelastnight/recorder/pcm"
+        private const val EVENTS_CHANNEL = "app.didisnorelastnight/recorder/events"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -55,6 +56,23 @@ class MainActivity : FlutterActivity() {
 
                 override fun onCancel(arguments: Any?) {
                     PcmBus.setSink(null)
+                }
+            })
+
+        // Recorder EVENTS stream (interruption began/ended). Separate from
+        // the PCM channel above so the high-rate audio sink and the low-rate
+        // status sink never share a sink (see RecorderEventBus). The service's
+        // AudioRecordingCallback pushes `{"type": ..., "atMs": ...}` maps onto
+        // RecorderEventBus, which hops to the main thread and calls this sink.
+        // Dart turns "interruption_ended" into a recording_gaps row.
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENTS_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    RecorderEventBus.setSink(events)
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    RecorderEventBus.setSink(null)
                 }
             })
 

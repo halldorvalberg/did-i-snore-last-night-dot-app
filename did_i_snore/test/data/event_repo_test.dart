@@ -320,6 +320,67 @@ void main() {
     });
   });
 
+  group('EventRepo.insertGap', () {
+    test('inserts a recording_gaps row readable back via the table', () async {
+      const startedAt = 1714900000000;
+      const endedAt = 1714900015000;
+
+      await repo.insertGap(
+        startedAt: startedAt,
+        endedAt: endedAt,
+        reason: 'interruption',
+      );
+
+      final rows = await db.select(db.recordingGaps).get();
+      expect(rows, hasLength(1),
+          reason: 'insertGap must write exactly one row');
+      final row = rows.single;
+      expect(row.startedAt, startedAt);
+      expect(row.endedAt, endedAt);
+      expect(row.reason, 'interruption');
+    });
+
+    test('preserves the reason string verbatim (plain-string contract)',
+        () async {
+      await repo.insertGap(
+        startedAt: 100,
+        endedAt: 200,
+        reason: 'route_change',
+      );
+      final row = (await db.select(db.recordingGaps).get()).single;
+      expect(row.reason, 'route_change',
+          reason: 'reason is persisted as-is, no enum mapping');
+    });
+  });
+
+  group('EventRepo.gapsForNightStream', () {
+    test('emits only gaps whose startedAt falls in the night window, '
+        'ordered ascending', () async {
+      final night = DateTime(2026, 6, 9);
+      final dayStart = DateTime(2026, 6, 9).millisecondsSinceEpoch;
+      // Two in-window gaps (out of order on insert) + one the day before
+      // and one the day after, which must be excluded.
+      await repo.insertGap(
+          startedAt: dayStart + 5 * 3600000,
+          endedAt: dayStart + 5 * 3600000 + 11000,
+          reason: 'interruption');
+      await repo.insertGap(
+          startedAt: dayStart + 1 * 3600000,
+          endedAt: dayStart + 1 * 3600000 + 6000,
+          reason: 'crash');
+      await repo.insertGap(
+          startedAt: dayStart - 1000, endedAt: dayStart, reason: 'interruption');
+      await repo.insertGap(
+          startedAt: dayStart + 24 * 3600000,
+          endedAt: dayStart + 24 * 3600000 + 1000,
+          reason: 'interruption');
+
+      final gaps = await repo.gapsForNightStream(night).first;
+      expect(gaps.map((g) => g.reason), ['crash', 'interruption'],
+          reason: 'only the two in-window gaps, ordered by startedAt ASC');
+    });
+  });
+
   group('EventRepo.encodeLabels / decodeLabels', () {
     test('round-trips a typical label map', () {
       final input = {'Snoring': 0.71, 'Other': 0.12};

@@ -41,7 +41,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
@@ -74,6 +76,37 @@ class RecorderService : Service() {
 
     private val stopRequested = AtomicBoolean(false)
     private var workerThread: Thread? = null
+
+    // ---- interruption detection (Android equivalent of §10.2) -----------
+    //
+    // We detect "the mic went deaf mid-recording" (phone call, concurrent-
+    // capture preemption, privacy mic-mute) purely via
+    // AudioManager.registerAudioRecordingCallback → isClientSilenced. No
+    // READ_PHONE_STATE, no PhoneStateListener, no audio focus — see
+    // RecorderEventBus header for the privacy rationale (§1.2 forbids
+    // announcing ourselves). Route changes (Bluetooth) are deliberately NOT
+    // handled here: a BT route change doesn't silence AudioRecord on Android,
+    // so reason='route_change' is deferred.
+    //
+    // `isClientSilenced` is API 29+. Below that the platform gives us no
+    // silencing signal, so detection is simply absent (best-effort; we ship
+    // API 24+ but the real device is 36). We do not add a focus-based
+    // fallback — that would contradict the passive-recorder contract.
+    private var audioManager: AudioManager? = null
+    private var recordingCallback: AudioManager.AudioRecordingCallback? = null
+
+    // Session id of OUR AudioRecord, captured once after start so the
+    // callback can pick our config out of the system-wide list by matching
+    // `config.clientAudioSessionId`.
+    private var audioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
+
+    // Previous silenced state, so we only emit on TRANSITIONS:
+    //   false → true  = interruption began
+    //   true  → false = interruption ended
+    // Volatile: written on the binder thread the callback fires on, read
+    // there too; kept volatile so a future cross-thread reset stays visible.
+    @Volatile
+    private var wasSilenced = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -235,6 +268,13 @@ class RecorderService : Service() {
 
         Log.i(TAG, "recorder started: source=$source sampleRate=$SAMPLE_RATE_HZ")
 
+        // Register the silencing watcher now that AudioRecord is live and has
+        // a real session id. Must be after startRecording() so our config
+        // actually appears in the system list.
+        audioSessionId = recorder.audioSessionId
+        wasSilenced = false
+        registerRecordingCallback()
+
         try {
             while (!stopRequested.get()) {
                 // Allocate a fresh buffer per read: the bytes are handed off to
@@ -264,11 +304,97 @@ class RecorderService : Service() {
         } catch (t: Throwable) {
             Log.e(TAG, "recorder loop crashed", t)
         } finally {
+            // Unregister BEFORE releasing AudioRecord. If we were stopped
+            // mid-interruption (wasSilenced == true), the Dart side closes
+            // the gap from its tracked start to `now` when MicSource.stop()
+            // tears down — we deliberately do NOT synthesize an
+            // "interruption_ended" here, because on a clean stop the mic
+            // never actually resumed. (See recorder_service.dart stop().)
+            unregisterRecordingCallback()
             try { recorder.stop() } catch (_: Throwable) {}
             try { recorder.release() } catch (_: Throwable) {}
             stopForegroundAndSelf()
         }
     }
+
+    // ------------------------------------------------------------------
+    // Interruption detection (isClientSilenced transitions)
+    // ------------------------------------------------------------------
+
+    private fun registerRecordingCallback() {
+        // isClientSilenced (and thus any useful signal) is API 29+. Below
+        // that we register nothing and interruption detection is absent.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Log.i(TAG, "interruption detection unavailable (API < 29)")
+            return
+        }
+        val mgr = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (mgr == null) {
+            Log.w(TAG, "AUDIO_SERVICE unavailable; interruption detection off")
+            return
+        }
+        val cb = object : AudioManager.AudioRecordingCallback() {
+            override fun onRecordingConfigChanged(
+                configs: MutableList<AudioRecordingConfiguration>,
+            ) {
+                handleRecordingConfigChanged(configs)
+            }
+        }
+        // Run the callback on the main looper handler — emissions hop to the
+        // main thread anyway (RecorderEventBus), and keeping callback +
+        // emit on one thread avoids any wasSilenced read/write race.
+        mgr.registerAudioRecordingCallback(cb, mainHandlerOrNull())
+        audioManager = mgr
+        recordingCallback = cb
+        Log.i(TAG, "registered AudioRecordingCallback (sessionId=$audioSessionId)")
+    }
+
+    private fun unregisterRecordingCallback() {
+        val mgr = audioManager
+        val cb = recordingCallback
+        if (mgr != null && cb != null) {
+            try { mgr.unregisterAudioRecordingCallback(cb) } catch (_: Throwable) {}
+            Log.i(TAG, "unregistered AudioRecordingCallback")
+        }
+        audioManager = null
+        recordingCallback = null
+        wasSilenced = false
+    }
+
+    private fun handleRecordingConfigChanged(
+        configs: List<AudioRecordingConfiguration>,
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        // Find OUR config by session id. The system list contains every
+        // active capture client; matching clientAudioSessionId isolates ours
+        // so another app's mic muting can't be misread as our interruption.
+        val ours = configs.firstOrNull {
+            it.clientAudioSessionId == audioSessionId
+        } ?: return  // our config briefly absent (e.g. mid-reconfig); ignore.
+
+        val silenced = ours.isClientSilenced
+        if (silenced == wasSilenced) return  // no transition
+
+        wasSilenced = silenced
+        val atMs = System.currentTimeMillis()
+        if (silenced) {
+            Log.i(TAG, "silenced-began atMs=$atMs (mic taken — call/preempt/mute)")
+            RecorderEventBus.emit(
+                mapOf("type" to "interruption_began", "atMs" to atMs),
+            )
+        } else {
+            Log.i(TAG, "silenced-ended atMs=$atMs (mic returned)")
+            RecorderEventBus.emit(
+                mapOf("type" to "interruption_ended", "atMs" to atMs),
+            )
+        }
+    }
+
+    /** Main-looper Handler for callback delivery, or null on the off chance
+     * the looper is unavailable (registerAudioRecordingCallback accepts a
+     * null handler and falls back to the calling thread's looper). */
+    private fun mainHandlerOrNull(): android.os.Handler? =
+        android.os.Looper.getMainLooper()?.let { android.os.Handler(it) }
 
     private fun stopForegroundAndSelf() {
         try {

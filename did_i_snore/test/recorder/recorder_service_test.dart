@@ -51,8 +51,16 @@ class _FakeMicSource extends MicSource {
   final StreamController<Uint8List> _ctrl =
       StreamController<Uint8List>.broadcast();
 
+  /// Fake of the native interruption-events stream (Android only in prod;
+  /// driven by tests here). Mirrors the real `MicSource.nativeEvents`.
+  final StreamController<Map<String, dynamic>> _events =
+      StreamController<Map<String, dynamic>>.broadcast();
+
   @override
   Stream<Uint8List> get pcm16 => _ctrl.stream;
+
+  @override
+  Stream<Map<String, dynamic>> get nativeEvents => _events.stream;
 
   @override
   Future<void> start() async {}
@@ -60,12 +68,20 @@ class _FakeMicSource extends MicSource {
   @override
   Future<void> stop() async {
     if (!_ctrl.isClosed) await _ctrl.close();
+    if (!_events.isClosed) await _events.close();
   }
 
   /// Push a chunk into the stream and yield to the microtask queue so the
   /// recorder's listener gets to process it before we push the next one.
   Future<void> push(Uint8List chunk) async {
     _ctrl.add(chunk);
+    await Future<void>.delayed(Duration.zero);
+  }
+
+  /// Push a native event map (e.g. interruption began/ended) and yield so
+  /// the recorder's `_onNativeEvent` handler processes it before we continue.
+  Future<void> pushEvent(Map<String, dynamic> event) async {
+    _events.add(event);
     await Future<void>.delayed(Duration.zero);
   }
 }
@@ -495,6 +511,129 @@ void main() {
         reason: 'audioPath must be the canonical relative layout from spec '
             '§6.3 — got ${row.audioPath}',
       );
+    });
+  });
+
+  // Android interruption → RecordingGap rows (the Android equivalent of the
+  // iOS §10.2 interruption handling). These drive the fake mic's native
+  // events stream directly — no PCM, no gate; the gap-writing path is
+  // independent of the audio pipeline.
+  group('RecorderService interruption gaps', () {
+    /// Builds a recorder wired to an in-memory repo and starts it. Returns
+    /// the pieces the tests poke at. The db is torn down automatically.
+    Future<({_FakeMicSource mic, RecorderService svc, AppDb db})> build() async {
+      final db = AppDb.forTesting(NativeDatabase.memory());
+      addTearDown(() async => db.close());
+      const floor = NoiseFloor(-50.0, 2.0);
+      final mic = _FakeMicSource();
+      final svc = RecorderService(
+        noiseFloor: floor,
+        mic: mic,
+        classifier: null,
+        repo: EventRepo(db),
+      );
+      await svc.start();
+      return (mic: mic, svc: svc, db: db);
+    }
+
+    Future<List<RecordingGap>> gapsOf(AppDb db) async {
+      final rows = await db.select(db.recordingGaps).get();
+      rows.sort((a, b) => a.startedAt.compareTo(b.startedAt));
+      return rows;
+    }
+
+    test('began → ended writes exactly one interruption gap with the right '
+        'start/end', () async {
+      final h = await build();
+
+      await h.mic.pushEvent({'type': 'interruption_began', 'atMs': 1000});
+      await h.mic.pushEvent({'type': 'interruption_ended', 'atMs': 16000});
+
+      // Yield for the fire-and-forget gap write (DB round-trip).
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final gaps = await gapsOf(h.db);
+      expect(gaps, hasLength(1),
+          reason: 'one began/ended pair → exactly one gap');
+      expect(gaps.single.startedAt, 1000);
+      expect(gaps.single.endedAt, 16000);
+      expect(gaps.single.reason, 'interruption');
+
+      await h.svc.stop();
+    });
+
+    test('began then stop() (no ended) writes a gap covering began→stop',
+        () async {
+      final h = await build();
+
+      final beforeStop = DateTime.now().millisecondsSinceEpoch;
+      await h.mic.pushEvent({'type': 'interruption_began', 'atMs': 5000});
+
+      // No matching `ended`. stop() must close the gap to ~now.
+      await h.svc.stop();
+      final afterStop = DateTime.now().millisecondsSinceEpoch;
+
+      final gaps = await gapsOf(h.db);
+      expect(gaps, hasLength(1),
+          reason: 'stop mid-interruption must close the open gap');
+      expect(gaps.single.startedAt, 5000);
+      expect(gaps.single.reason, 'interruption');
+      // endedAt is wall-clock `now` at stop() — bracket it loosely.
+      expect(gaps.single.endedAt, greaterThanOrEqualTo(beforeStop));
+      expect(gaps.single.endedAt, lessThanOrEqualTo(afterStop + 1000));
+    });
+
+    test('no interruption events → no gap rows', () async {
+      final h = await build();
+
+      // Push some PCM-free silence: just stop cleanly with no events.
+      await h.svc.stop();
+
+      final gaps = await gapsOf(h.db);
+      expect(gaps, isEmpty,
+          reason: 'a session with no interruption writes no gaps');
+    });
+
+    test('ended with endedAt <= began startedAt is not written (degenerate)',
+        () async {
+      final h = await build();
+
+      await h.mic.pushEvent({'type': 'interruption_began', 'atMs': 10000});
+      // `ended` arrives at or before the start — a clock glitch. The guard
+      // in _writeGap must drop it rather than persist a zero/negative gap.
+      await h.mic.pushEvent({'type': 'interruption_ended', 'atMs': 10000});
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final gaps = await gapsOf(h.db);
+      expect(gaps, isEmpty,
+          reason: 'endedAt <= startedAt must not produce a gap row');
+
+      await h.svc.stop();
+    });
+
+    test('duplicate began keeps the earliest start; trailing ended without '
+        'began is ignored', () async {
+      final h = await build();
+
+      await h.mic.pushEvent({'type': 'interruption_began', 'atMs': 2000});
+      // Second `began` before any `ended` — keep the FIRST start so the gap
+      // spans the whole dead period.
+      await h.mic.pushEvent({'type': 'interruption_began', 'atMs': 4000});
+      await h.mic.pushEvent({'type': 'interruption_ended', 'atMs': 9000});
+      // Stray `ended` with nothing open — must be ignored, no second gap.
+      await h.mic.pushEvent({'type': 'interruption_ended', 'atMs': 12000});
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      final gaps = await gapsOf(h.db);
+      expect(gaps, hasLength(1),
+          reason: 'one gap spanning the earliest began to the first ended');
+      expect(gaps.single.startedAt, 2000,
+          reason: 'duplicate began keeps the earliest start');
+      expect(gaps.single.endedAt, 9000);
+
+      await h.svc.stop();
     });
   });
 }

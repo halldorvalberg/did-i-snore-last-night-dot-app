@@ -61,6 +61,15 @@ class MicSource {
   static const EventChannel _pcm =
       EventChannel('app.didisnorelastnight/recorder/pcm');
 
+  /// Events stream channel — the service pushes small status maps here via
+  /// `RecorderEventBus` (currently `interruption_began` / `interruption_ended`,
+  /// each carrying an `atMs` epoch timestamp). Distinct from the PCM channel
+  /// so the audio hot path stays byte-only. The Android equivalent of the
+  /// iOS §10.2 interruption handling: `RecorderService` listens to it and
+  /// writes `recording_gaps` rows.
+  static const EventChannel _events =
+      EventChannel('app.didisnorelastnight/recorder/events');
+
   // ---- record plugin (iOS + test host) ------------------------------------
 
   final AudioRecorder _recorder = AudioRecorder();
@@ -69,12 +78,29 @@ class MicSource {
   /// iOS/test it's the `record` plugin stream. Same field, same lifecycle.
   StreamSubscription<dynamic>? _sub;
 
+  /// Active subscription to the native events `EventChannel`. Android only;
+  /// null on iOS/test where there is no native event source.
+  StreamSubscription<dynamic>? _eventsSub;
+
   final StreamController<Uint8List> _out =
       StreamController<Uint8List>.broadcast();
+
+  /// Native recorder events (interruption began/ended). Broadcast so multiple
+  /// listeners can observe without contending. Populated only on Android; on
+  /// iOS/test it stays empty (no event source is wired), so `RecorderService`
+  /// subscribes unconditionally and simply never fires on those platforms.
+  final StreamController<Map<String, dynamic>> _eventsOut =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   /// Broadcast stream of raw PCM chunks. Subscribers see chunks exactly as
   /// the platform delivers them; framing is downstream.
   Stream<Uint8List> get pcm16 => _out.stream;
+
+  /// Broadcast stream of native recorder status events. Each element is a map
+  /// like `{'type': 'interruption_began', 'atMs': 1234567890}`. Empty on
+  /// non-Android platforms (incl. the Dart-VM test host), so iOS and unit
+  /// tests are unaffected — they get a stream that never emits.
+  Stream<Map<String, dynamic>> get nativeEvents => _eventsOut.stream;
 
   /// Begins streaming. Throws `StateError` if mic permission is denied —
   /// the consent flow in Phase 0 must have already granted it.
@@ -118,6 +144,17 @@ class MicSource {
       }
     });
 
+    // Subscribe to the native events channel too (interruption began/ended).
+    // Same ordering rationale: register the sink before `start` so the
+    // RecorderEventBus has somewhere to push the first transition. The
+    // platform delivers each event as a `Map`; normalize to
+    // `Map<String, dynamic>` for downstream type-safety.
+    _eventsSub = _events.receiveBroadcastStream().listen((event) {
+      if (event is Map) {
+        _eventsOut.add(event.map((k, v) => MapEntry(k.toString(), v)));
+      }
+    });
+
     await _method.invokeMethod<void>('start');
   }
 
@@ -152,6 +189,10 @@ class MicSource {
       await _method.invokeMethod<void>('stop');
       await _sub?.cancel();
       _sub = null;
+      // Cancel the events subscription too — triggers `onCancel` on the
+      // native side, clearing the RecorderEventBus sink.
+      await _eventsSub?.cancel();
+      _eventsSub = null;
     } else {
       await _sub?.cancel();
       _sub = null;

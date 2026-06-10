@@ -292,6 +292,22 @@ class RecorderService {
   StreamSubscription<Uint8List>? _sub;
   bool _running = false;
 
+  /// Subscription to `_mic.nativeEvents` (Android interruption began/ended).
+  /// Empty/never-firing on iOS and in tests, so this is always set in
+  /// `start()` and torn down in `stop()` regardless of platform.
+  StreamSubscription<Map<String, dynamic>>? _eventsSub;
+
+  /// Epoch ms at which the current interruption began, or null when no
+  /// interruption is in progress. Set on `interruption_began`, cleared after
+  /// the matching `interruption_ended` writes its gap row. If still set at
+  /// `stop()`, we were stopped mid-interruption and close the gap to `now`.
+  ///
+  /// This is the Android equivalent of the iOS §10.2 interruption handling:
+  /// `.began` logs gap-start, `.ended` writes the `RecordingGap` covering the
+  /// dead period. There is no `shouldResume == false` branch on Android — the
+  /// silencing callback only fires `ended` when the mic actually came back.
+  int? _interruptionStartMs;
+
   /// Periodic heartbeat timer — writes `last_heartbeat_at` every
   /// `RetentionCfg.heartbeatIntervalSeconds`. Started in `start()`,
   /// cancelled in `stop()`. Null when crash heartbeat is disabled or
@@ -316,6 +332,10 @@ class RecorderService {
     if (_running) return;
     _running = true;
     _sub = _mic.pcm16.listen(_onChunk);
+    // Listen for native interruption events (Android only; a never-firing
+    // stream elsewhere). Subscribe before `_mic.start()` so the very first
+    // transition isn't missed in the window before we're listening.
+    _eventsSub = _mic.nativeEvents.listen(_onNativeEvent);
     await _mic.start();
     if (_crashHeartbeatEnabled) {
       // Mark the session-start anchor BEFORE the first heartbeat
@@ -355,6 +375,19 @@ class RecorderService {
     _heartbeatTimer = null;
     await _sub?.cancel();
     _sub = null;
+    // If we were stopped mid-interruption (a `began` with no matching
+    // `ended`), close the gap to `now` before tearing down. The native
+    // service deliberately does NOT synthesize an `ended` on a clean stop —
+    // the mic never resumed — so this Dart-side close is the only chance to
+    // persist that final dead period. (§10.2 equivalent.)
+    final pendingStart = _interruptionStartMs;
+    if (pendingStart != null) {
+      _interruptionStartMs = null;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await _writeGap(pendingStart, now);
+    }
+    await _eventsSub?.cancel();
+    _eventsSub = null;
     await _mic.stop();
     _probe.dispose();
     // An in-flight event window at stop time is by definition
@@ -396,6 +429,56 @@ class RecorderService {
   /// In-flight event window, set on `GateOpened`, cleared on
   /// `GateClosed` (or on `stop()`).
   EventWindow? _current;
+
+  /// Handle a native recorder event (Android interruption began/ended).
+  /// Android equivalent of the iOS §10.2 interruption handling: on `began`
+  /// we record the gap-start; on `ended` we write a `RecordingGap` row
+  /// (`reason='interruption'`) covering the dead period, then clear the
+  /// start. Route changes (`reason='route_change'`) are NOT emitted by the
+  /// Android service yet — a BT route change doesn't silence AudioRecord —
+  /// so they're deferred and this handler only ever sees interruptions.
+  ///
+  /// Defensive against malformed/duplicate transitions: a second `began`
+  /// without an intervening `ended` keeps the FIRST start (the gap should
+  /// span the whole dead period); an `ended` with no prior `began` is
+  /// ignored (nothing to close).
+  void _onNativeEvent(Map<String, dynamic> event) {
+    final type = event['type'];
+    final atMs = event['atMs'];
+    if (atMs is! int) return; // malformed; nothing actionable.
+    if (type == 'interruption_began') {
+      // Keep the earliest start if a duplicate `began` arrives.
+      _interruptionStartMs ??= atMs;
+    } else if (type == 'interruption_ended') {
+      final start = _interruptionStartMs;
+      if (start == null) return; // no open interruption; ignore.
+      _interruptionStartMs = null;
+      // Fire-and-forget the gap write (consistent with the rest of the
+      // recorder's DB writes — the event listener must not stall). The
+      // `_writeGap` guard drops degenerate (endedAt <= startedAt) gaps.
+      // ignore: discarded_futures
+      _writeGap(start, atMs);
+    }
+  }
+
+  /// Write one `recording_gaps` row via the repo, guarding against a
+  /// degenerate `endedAt <= startedAt` span. No-op when no repo is injected
+  /// (unit tests that don't wire persistence).
+  Future<void> _writeGap(int startedAt, int endedAt) async {
+    if (endedAt <= startedAt) return; // degenerate; don't persist.
+    final repo = _repo;
+    if (repo == null) return;
+    try {
+      await repo.insertGap(
+        startedAt: startedAt,
+        endedAt: endedAt,
+        reason: 'interruption',
+      );
+    } catch (_) {
+      // Swallow — a failed gap write is telemetry loss, not a recording
+      // failure. Surfaced via debug telemetry in a later phase if needed.
+    }
+  }
 
   /// Process one mic chunk. Called from the broadcast stream listener;
   /// must be allocation-light (the only allocations on the no-event path

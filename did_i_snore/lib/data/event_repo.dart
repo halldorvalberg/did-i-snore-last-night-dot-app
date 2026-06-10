@@ -81,6 +81,37 @@ class EventRepo {
         );
   }
 
+  /// Inserts one `recording_gaps` row — a period the recorder was deaf
+  /// within an active session. Spec §10.2.
+  ///
+  /// Used by `RecorderService` for `reason='interruption'` (the Android
+  /// equivalent of the iOS interruption handling), and by
+  /// `CrashHeartbeat`-style recovery for `reason='crash'`. The row surfaces
+  /// as a `GapTile` once the night's `gapsForNightProvider` stream emits it;
+  /// no UI work is needed beyond the insert.
+  ///
+  /// The caller is responsible for the `endedAt > startedAt` guard — a
+  /// zero/negative-width gap is meaningless and would draw a degenerate
+  /// tile. We assert it here (dev) but do not silently clamp, so a caller
+  /// bug surfaces rather than producing a misleading row.
+  Future<void> insertGap({
+    required int startedAt,
+    required int endedAt,
+    required String reason,
+  }) async {
+    assert(
+      endedAt > startedAt,
+      'recording_gaps requires endedAt ($endedAt) > startedAt ($startedAt)',
+    );
+    await _db.into(_db.recordingGaps).insert(
+          RecordingGapsCompanion(
+            startedAt: Value(startedAt),
+            endedAt: Value(endedAt),
+            reason: Value(reason),
+          ),
+        );
+  }
+
   /// Flips a row from `state='pending'` to `state='ready'`, populating
   /// the post-encode columns. Called by the encoder *after* the
   /// `.tmp` → final rename succeeds.
@@ -159,6 +190,28 @@ class EventRepo {
           e.startedAt.isBiggerOrEqualValue(startMs) &
           e.startedAt.isSmallerThanValue(endMs))
       ..orderBy([(e) => OrderingTerm.asc(e.startedAt)]);
+    return query.watch();
+  }
+
+  /// Live stream of `recording_gaps` rows for `night`, in the same local
+  /// `[nightStart, nightStart + 24h)` window and `startedAt ASC` order as
+  /// [eventsForNightStream], so the timeline can interleave gaps with
+  /// events on one time axis. Gaps come from native interruption events
+  /// (`reason='interruption'`, Phase 10.2 / Tier 2) and crash detection
+  /// (`reason='crash'`, `crash_heartbeat.dart`). Unlike events there is no
+  /// `state`/`deletedAt` filter — a gap is a fact about the recording,
+  /// not a soft-deletable artifact.
+  Stream<List<RecordingGap>> gapsForNightStream(DateTime night) {
+    final dayStart = DateTime(night.year, night.month, night.day);
+    final dayEnd = dayStart.add(const Duration(days: 1));
+    final startMs = dayStart.millisecondsSinceEpoch;
+    final endMs = dayEnd.millisecondsSinceEpoch;
+
+    final query = _db.select(_db.recordingGaps)
+      ..where((g) =>
+          g.startedAt.isBiggerOrEqualValue(startMs) &
+          g.startedAt.isSmallerThanValue(endMs))
+      ..orderBy([(g) => OrderingTerm.asc(g.startedAt)]);
     return query.watch();
   }
 

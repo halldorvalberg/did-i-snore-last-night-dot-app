@@ -22,11 +22,10 @@
 ///   should still surface a spinner when this provider's `AsyncValue`
 ///   is `loading` because the first record-button tap waits on it.
 ///
-/// **Empty `gapsForNightProvider`:** Phase 10 will populate the
-/// `recording_gaps` table from native interruption notifications. For
-/// v1 (Phase 8) the timeline interleave logic is in place but the
-/// stream returns `const <RecordingGap>[]` — the provider shape stays
-/// stable so the timeline doesn't have to grow a Phase 10 branch later.
+/// **`gapsForNightProvider`** streams `recording_gaps` for the night via
+/// `EventRepo.gapsForNightStream` — rows inserted by native interruption
+/// detection (`reason='interruption'`) and crash detection
+/// (`reason='crash'`). The timeline interleaves them with events.
 ///
 /// **No telemetry, no analytics, no crash reporters.** Spec line 902 —
 /// if a future dep tries to add one, refuse it.
@@ -255,14 +254,17 @@ int get manageStorageFreeBytesThreshold =>
 
 /// Live stream of the night's recording gaps. Spec §8 line 883.
 ///
-/// **Phase 8 placeholder.** Phase 10 wires the native interruption /
-/// route-change listeners that insert rows into `recording_gaps`; until
-/// then this returns an empty stream. Keeping the provider shape stable
-/// means the timeline's interleave logic doesn't sprout a Phase 10 if
-/// branch — once Phase 10 lands, only this provider body changes.
+/// Wired to `recording_gaps` (Phase 10.2 / Tier 2): rows are inserted by
+/// the native interruption path (`reason='interruption'`, via
+/// `RecorderService`) and crash detection (`reason='crash'`,
+/// `crash_heartbeat.dart`). The timeline interleaves these with events on
+/// one axis. `route_change` gaps remain deferred (a Bluetooth route change
+/// doesn't silence `AudioRecord` on Android).
 final gapsForNightProvider =
     StreamProvider.family<List<RecordingGap>, DateTime>((ref, night) {
-  // TODO Phase 10: query recording_gaps by [nightStart, nightStart+24h)
-  // window and surface as a Drift `.watch()` stream.
-  return Stream.value(const <RecordingGap>[]);
+  // Phase 10.2 / Tier 2: gaps now come from native interruption events
+  // (`reason='interruption'`) and crash detection (`reason='crash'`),
+  // surfaced via a Drift `.watch()` over the same
+  // `[nightStart, nightStart+24h)` window as `eventsForNightProvider`.
+  return ref.watch(eventRepoProvider).gapsForNightStream(night);
 });
